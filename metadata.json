@@ -1,0 +1,7 @@
+{
+  "name": "Landcros Connect Insight",
+  "description": "A comprehensive machine parts catalog and inspection tool.",
+  "requestFramePermissions": [
+    "camera"
+  ]
+}
