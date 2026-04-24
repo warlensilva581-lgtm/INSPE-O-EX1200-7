@@ -1,6 +1,6 @@
 {
-  "name": "Landcros Connect Insight",
-  "description": "A comprehensive machine parts catalog and inspection tool.",
+  "name": "Landcros Connect Insight - Image Editor",
+  "description": "Ferramenta de catálogo de peças com comandos de manipular imagem: aumentar, diminuir, rotacionar e deslocar.",
   "requestFramePermissions": [
     "camera"
   ]

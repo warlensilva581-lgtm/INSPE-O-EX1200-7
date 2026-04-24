@@ -1,4 +1,4 @@
-import React, { useState, useMemo, useEffect, useCallback } from 'react';
+import React, { useState, useMemo, useEffect, useCallback, useRef } from 'react';
 import { 
   Search, 
   ClipboardList, 
@@ -16,6 +16,12 @@ import {
   List,
   Info,
   ArrowLeft,
+  ArrowRight,
+  ArrowUp,
+  ArrowDown,
+  RotateCw,
+  ZoomIn,
+  ZoomOut,
   Trash2,
   Lock,
   Unlock,
@@ -65,7 +71,12 @@ import { CATALOG_STRUCTURE, GroupInfo, SheetInfo } from './catalogStructure';
 type ListType = 'order' | 'damaged';
 type ViewMode = 'visual' | 'list' | 'bom';
 type Criticality = 'A' | 'B' | 'C' | null;
-type AnnotationType = 'circle' | 'arrow' | 'box' | 'text' | 'callout' | 'crop-circle' | 'eraser' | 'leader' | 'none';
+type AnnotationType = 'circle' | 'arrow' | 'box' | 'text' | 'callout' | 'crop-circle' | 'eraser' | 'leader' | 'photo' | 'none';
+
+interface HighlightState {
+  isOpen: boolean;
+  activeAnnId: string | null;
+}
 
 interface Annotation {
   id: string;
@@ -80,6 +91,8 @@ interface Annotation {
   text?: string;
   fontSize?: number;
   isMagnifier?: boolean;
+  strokeWidth?: number;
+  photoUrl?: string;
 }
 
 interface SelectedItem {
@@ -115,14 +128,103 @@ interface ImgConfig {
   isLocked?: boolean;
 }
 
+// Internal component for optimized sliders
+const PropertySlider = ({ label, value, min, max, onChange, onInteractionStart, onInteractionEnd, unit = "" }: {
+  label: string;
+  value: number;
+  min: number;
+  max: number;
+  onChange: (val: number) => void;
+  onInteractionStart?: () => void;
+  onInteractionEnd?: () => void;
+  unit?: string;
+}) => {
+  const [localValue, setLocalValue] = useState(value);
+
+  // Sync local value when external value changes (e.g. selecting another annotation)
+  useEffect(() => {
+    setLocalValue(value);
+  }, [value]);
+
+  const handleChange = (e: React.ChangeEvent<HTMLInputElement>) => {
+    const val = parseInt(e.target.value);
+    setLocalValue(val);
+    // Allow real-time updates while interacting
+    onChange(val);
+  };
+
+  // commit on mouse up / touch end anyway to ensure persistence flow
+  const handleCommit = () => {
+    onInteractionEnd?.();
+    if (localValue !== value) {
+      onChange(localValue);
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      <div className="flex justify-between items-center text-[8px] font-black text-zinc-500 uppercase tracking-widest">
+        <span>{label}</span>
+        <span>{localValue}{unit}</span>
+      </div>
+      <input 
+        type="range" 
+        min={min} 
+        max={max} 
+        className="w-full accent-landcros cursor-pointer"
+        value={localValue}
+        onPointerDown={onInteractionStart}
+        onChange={handleChange}
+        onPointerUp={handleCommit}
+      />
+    </div>
+  );
+};
+
+// Internal component for optimized text inputs
+const PropertyInput = ({ label, value, onChange }: {
+  label: string;
+  value: string;
+  onChange: (val: string) => void;
+}) => {
+  const [localValue, setLocalValue] = useState(value);
+
+  useEffect(() => {
+    setLocalValue(value);
+  }, [value]);
+
+  const handleBlur = () => {
+    if (localValue !== value) {
+      onChange(localValue);
+    }
+  };
+
+  const handleKeyDown = (e: React.KeyboardEvent) => {
+    if (e.key === 'Enter') {
+      handleBlur();
+    }
+  };
+
+  return (
+    <div className="space-y-2">
+      <span className="text-[8px] font-black text-zinc-500 uppercase tracking-widest">{label}</span>
+      <input 
+        type="text"
+        value={localValue}
+        onChange={(e) => setLocalValue(e.target.value)}
+        onBlur={handleBlur}
+        onKeyDown={handleKeyDown}
+        className="w-full bg-black/40 border border-white/10 rounded-xl px-3 py-2 text-[10px] text-white font-black uppercase tracking-widest focus:border-landcros outline-none"
+      />
+    </div>
+  );
+};
+
 export default function App() {
   const [searchTerm, setSearchTerm] = useState('');
   const [selectedGroup, setSelectedGroup] = useState<string>(CATALOG_STRUCTURE[0].name);
   const [selectedCategory, setSelectedCategory] = useState<string>(CATALOG_STRUCTURE[0].sheets[0].name);
-  const [selectedItems, setSelectedItems] = useState<SelectedItem[]>(() => {
-    const saved = localStorage.getItem('selectedItems');
-    return saved ? JSON.parse(saved) : [];
-  });
+  const [selectedItems, setSelectedItems] = useState<SelectedItem[]>([]);
   const [inspectionInfo, setInspectionInfo] = useState<InspectionInfo>(() => {
     const saved = localStorage.getItem('inspectionInfo');
     return saved ? JSON.parse(saved) : {
@@ -139,6 +241,30 @@ export default function App() {
       conclusion: ''
     };
   });
+
+  const compressImage = useCallback((dataUrl: string, maxWidth = 1024, quality = 0.6): Promise<string> => {
+    return new Promise((resolve) => {
+      const img = new Image();
+      img.onload = () => {
+        const canvas = document.createElement('canvas');
+        let width = img.width;
+        let height = img.height;
+
+        if (width > maxWidth) {
+          height = (maxWidth / width) * height;
+          width = maxWidth;
+        }
+
+        canvas.width = width;
+        canvas.height = height;
+        const ctx = canvas.getContext('2d');
+        ctx?.drawImage(img, 0, 0, width, height);
+        resolve(canvas.toDataURL('image/jpeg', quality));
+      };
+      img.src = dataUrl;
+    });
+  }, []);
+
   const [viewMode, setViewMode] = useState<ViewMode>('visual');
   const [focusedPart, setFocusedPart] = useState<Part | null>(null);
   // Persistent State with IndexedDB for large data (images) and LocalStorage for small data
@@ -175,6 +301,7 @@ export default function App() {
   const [showNewProjectModal, setShowNewProjectModal] = useState(false);
   const [showBomModal, setShowBomModal] = useState(false);
   const [bomInput, setBomInput] = useState('');
+  const [highlightState, setHighlightState] = useState<HighlightState>({ isOpen: false, activeAnnId: null });
   const [customCategories, setCustomCategories] = useState<Record<string, string[]>>(() => {
     const saved = localStorage.getItem('customCategories');
     try {
@@ -197,6 +324,101 @@ export default function App() {
   const [pinInput, setPinInput] = useState('');
   const [showLinkModal, setShowLinkModal] = useState<{ from: string } | null>(null);
   const [saveStatus, setSaveStatus] = useState<'saved' | 'saving' | 'error'>('saved');
+  const isInteractingRef = useRef(false);
+  const [imageBlobUrls, setImageBlobUrls] = useState<Record<string, string>>({});
+  const [activeItemBlobUrl, setActiveItemBlobUrl] = useState<string | null>(null);
+  const [annotationBlobUrls, setAnnotationBlobUrls] = useState<Record<string, string>>({});
+
+  // Memoized entities for Highlight Modal to avoid repeated lookups during render
+  const activeHighlightItem = useMemo(() => {
+    if (!highlightState.isOpen || !focusedPart) return null;
+    return selectedItems.find(i => i.part.id === focusedPart.id);
+  }, [highlightState.isOpen, focusedPart, selectedItems]);
+
+  const activeHighlightAnn = useMemo(() => {
+    if (!activeHighlightItem || !highlightState.activeAnnId) return null;
+    return (activeHighlightItem.annotations || []).find(a => a.id === highlightState.activeAnnId);
+  }, [activeHighlightItem, highlightState.activeAnnId]);
+
+  // Global cache for Blobs to avoid repeated decoding
+  const blobCache = useRef<Map<string, string>>(new Map());
+  
+  const getBlobUrl = useCallback((base64: string) => {
+    if (!base64 || !base64.startsWith('data:')) return base64;
+    
+    // Use a hash or first/last chars as key
+    const key = base64.length + base64.substring(0, 50) + base64.substring(base64.length - 50);
+    if (blobCache.current.has(key)) {
+      return blobCache.current.get(key)!;
+    }
+
+    try {
+      const parts = base64.split(',');
+      const byteString = atob(parts[1]);
+      const mimeString = parts[0].split(':')[1].split(';')[0];
+      const ab = new ArrayBuffer(byteString.length);
+      const ia = new Uint8Array(ab);
+      for (let i = 0; i < byteString.length; i++) ia[i] = byteString.charCodeAt(i);
+      const blob = new Blob([ab], { type: mimeString });
+      const url = URL.createObjectURL(blob);
+      blobCache.current.set(key, url);
+      return url;
+    } catch (e) {
+      console.error("Blob creation failed", e);
+      return base64;
+    }
+  }, []);
+
+  // Sync diagram Blob URLs
+  useEffect(() => {
+    const urls: Record<string, string> = {};
+    Object.entries(diagramImages).forEach(([key, base64]) => {
+      if (base64) {
+        urls[key] = getBlobUrl(base64);
+      }
+    });
+    setImageBlobUrls(urls);
+  }, [diagramImages, getBlobUrl]);
+
+  // Sync active item Blob URLs
+  useEffect(() => {
+    if (activeHighlightItem?.photo) {
+      setActiveItemBlobUrl(getBlobUrl(activeHighlightItem.photo));
+    } else {
+      setActiveItemBlobUrl(null);
+    }
+  }, [activeHighlightItem?.photo, getBlobUrl]);
+
+  const [localItemQuantity, setLocalItemQuantity] = useState(1);
+
+  // Separate effect for annotation photos to avoid re-runs during move/resize
+  const annPhotoKey = (activeHighlightItem?.annotations || []).filter(a => a.type === 'photo').map(a => a.id + a.photoUrl).join('|');
+  const activePartId = activeHighlightItem?.part.id;
+
+  useEffect(() => {
+    if (!activeHighlightItem) {
+      setAnnotationBlobUrls({});
+      setLocalItemQuantity(1);
+      return;
+    }
+    
+    // Set local quantity from existing item if it exists
+    const existing = selectedItems.find(i => i.part.id === activeHighlightItem.part.id);
+    if (existing) {
+      setLocalItemQuantity(existing.quantity || 1);
+    } else {
+      setLocalItemQuantity(1);
+    }
+
+    const annUrls: Record<string, string> = {};
+    (activeHighlightItem.annotations || []).forEach(ann => {
+      if (ann.type === 'photo' && ann.photoUrl) {
+        annUrls[ann.id] = getBlobUrl(ann.photoUrl);
+      }
+    });
+    setAnnotationBlobUrls(annUrls);
+  }, [activePartId, annPhotoKey, getBlobUrl, activeHighlightItem, selectedItems]);
+
   const [language, setLanguage] = useState<'pt' | 'en'>(() => (localStorage.getItem('language') as 'pt' | 'en') || 'pt');
   
   const translations = {
@@ -414,23 +636,49 @@ export default function App() {
   const [draggingAnnId, setDraggingAnnId] = useState<string | null>(null);
   const [resizingAnnId, setResizingAnnId] = useState<string | null>(null);
   const [dragOffset, setDragOffset] = useState({ x: 0, y: 0 });
+  const [isHighlightDragging, setIsHighlightDragging] = useState(false);
+  const interactionRectRef = useRef<DOMRect | null>(null);
 
   // Load images from IndexedDB on mount and migrate from localStorage if needed
   useEffect(() => {
     const initStorage = async () => {
       try {
         const savedImages = await storage.getImages();
+        const savedAnnotations = await storage.getAnnotations();
+        const savedSelectedItems = await storage.getSelectedItems();
         
         // Migration from localStorage
         const legacyImages = localStorage.getItem('diagramImages');
+        const legacyAnnotations = localStorage.getItem('diagramAnnotations');
+        const legacySelectedItems = localStorage.getItem('selectedItems');
+
         if (legacyImages && Object.keys(savedImages).length === 0) {
-          const parsedLegacy = JSON.parse(legacyImages);
-          await storage.saveImages(parsedLegacy);
-          setDiagramImages(parsedLegacy);
-          localStorage.removeItem('diagramImages'); // Clean up
+          const parsed = JSON.parse(legacyImages);
+          await storage.saveImages(parsed);
+          setDiagramImages(parsed);
+          localStorage.removeItem('diagramImages');
         } else {
           setDiagramImages(savedImages);
         }
+
+        if (legacyAnnotations && Object.keys(savedAnnotations).length === 0) {
+          const parsed = JSON.parse(legacyAnnotations);
+          await storage.saveAnnotations(parsed);
+          setDiagramAnnotations(parsed);
+          localStorage.removeItem('diagramAnnotations');
+        } else {
+          setDiagramAnnotations(savedAnnotations);
+        }
+
+        if (legacySelectedItems && savedSelectedItems.length === 0) {
+          const parsed = JSON.parse(legacySelectedItems);
+          await storage.saveSelectedItems(parsed);
+          setSelectedItems(parsed);
+          localStorage.removeItem('selectedItems');
+        } else {
+          setSelectedItems(savedSelectedItems);
+        }
+
         setIsStorageReady(true);
       } catch (e) {
         console.error('Failed to initialize storage', e);
@@ -446,10 +694,12 @@ export default function App() {
   // Annotation State
   const [activeTool, setActiveTool] = useState<AnnotationType>('none');
   const [activeColor, setActiveColor] = useState('#f27d26'); // Landcros Orange default
-  const [diagramAnnotations, setDiagramAnnotations] = useState<Record<string, Annotation[]>>(() => {
-    const saved = localStorage.getItem('diagramAnnotations');
-    return saved ? JSON.parse(saved) : {};
-  });
+  const [isDiagramToolbarVisible, setIsDiagramToolbarVisible] = useState(true);
+  const [isHighlightToolbarVisible, setIsHighlightToolbarVisible] = useState(true);
+  const [diagramAnnotations, setDiagramAnnotations] = useState<Record<string, Annotation[]>>({});
+
+  // Save tracking to prevent multiple concurrent saves
+  const isSavingRef = useRef(false);
 
   // Save to localStorage whenever state changes
   useEffect(() => {
@@ -475,33 +725,55 @@ export default function App() {
     if (!isStorageReady) return;
 
     const save = async () => {
+      if (isSavingRef.current || isInteractingRef.current || highlightState.isOpen) {
+        console.log('Skipping auto-save: interacting, modal open, or already saving');
+        return;
+      }
+      
       try {
+        isSavingRef.current = true;
         setSaveStatus('saving');
         
-        // Save images to IndexedDB (large data)
-        await storage.saveImages(diagramImages);
+        console.log('Auto-saving data...');
+        // Save large data to IndexedDB
+        await Promise.all([
+          storage.saveImages(diagramImages),
+          storage.saveAnnotations(diagramAnnotations),
+          storage.saveSelectedItems(selectedItems)
+        ]);
         
         // Save other configs to localStorage (small data)
-        localStorage.setItem('imgConfigs', JSON.stringify(imgConfigs));
-        localStorage.setItem('selectedItems', JSON.stringify(selectedItems));
-        localStorage.setItem('imgFilters', JSON.stringify(imgFilters));
-        localStorage.setItem('inspectionInfo', JSON.stringify(inspectionInfo));
-        localStorage.setItem('projectName', projectName);
-        localStorage.setItem('adminPin', adminPin);
-        localStorage.setItem('customCategories', JSON.stringify(customCategories));
-        localStorage.setItem('customParts', JSON.stringify(customParts));
-        localStorage.setItem('diagramAnnotations', JSON.stringify(diagramAnnotations));
+        const storageData = {
+          imgConfigs: JSON.stringify(imgConfigs),
+          imgFilters: JSON.stringify(imgFilters),
+          inspectionInfo: JSON.stringify(inspectionInfo),
+          projectName,
+          adminPin,
+          customCategories: JSON.stringify(customCategories),
+          customParts: JSON.stringify(customParts)
+        };
+
+        localStorage.setItem('imgConfigs', storageData.imgConfigs);
+        localStorage.setItem('imgFilters', storageData.imgFilters);
+        localStorage.setItem('inspectionInfo', storageData.inspectionInfo);
+        localStorage.setItem('projectName', storageData.projectName);
+        localStorage.setItem('adminPin', storageData.adminPin);
+        localStorage.setItem('customCategories', storageData.customCategories);
+        localStorage.setItem('customParts', storageData.customParts);
         
-        setTimeout(() => setSaveStatus('saved'), 500);
+        setSaveStatus('saved');
       } catch (e) {
-        console.error('Storage error', e);
+        console.error('Storage error during auto-save:', e);
         setSaveStatus('error');
+      } finally {
+        isSavingRef.current = false;
       }
     };
     
-    const timeout = setTimeout(save, 1000);
+    // Increased debounce to 3s to allow user to finish modifications before major serialization
+    const timeout = setTimeout(save, 3000);
     return () => clearTimeout(timeout);
-  }, [diagramImages, imgConfigs, selectedItems, projectName, customCategories, customParts, isStorageReady, adminPin, diagramAnnotations, imgFilters, inspectionInfo]);
+  }, [diagramImages, imgConfigs, selectedItems, projectName, customCategories, customParts, isStorageReady, adminPin, diagramAnnotations, imgFilters, inspectionInfo, highlightState.isOpen]);
 
   const exportProject = () => {
     const data = {
@@ -666,7 +938,7 @@ export default function App() {
     setIsCameraOpen(false);
   }, [cameraStream]);
 
-  const capturePhoto = () => {
+  const capturePhoto = async () => {
     if (videoRef.current && videoRef.current.videoWidth > 0) {
       const canvas = document.createElement('canvas');
       canvas.width = videoRef.current.videoWidth;
@@ -675,7 +947,8 @@ export default function App() {
       if (ctx) {
         ctx.drawImage(videoRef.current, 0, 0);
         try {
-          const dataUrl = canvas.toDataURL('image/jpeg', 0.8);
+          const rawUrl = canvas.toDataURL('image/jpeg', 0.8);
+          const dataUrl = await compressImage(rawUrl);
           if (focusedPart) {
             setSelectedItems(prev => {
               const exists = prev.find(i => i.part.id === focusedPart.id);
@@ -721,12 +994,13 @@ export default function App() {
     }
   };
 
-  const handleInspectionPhotoUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleInspectionPhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file && focusedPart) {
       const reader = new FileReader();
-      reader.onload = (event) => {
-        const dataUrl = event.target?.result as string;
+      reader.onload = async (event) => {
+        const rawUrl = event.target?.result as string;
+        const dataUrl = await compressImage(rawUrl);
         setSelectedItems(prev => {
           const exists = prev.find(i => i.part.id === focusedPart.id);
           if (exists) {
@@ -793,6 +1067,8 @@ export default function App() {
   }, [allGroups, selectedGroup, selectedCategory]);
 
   const innerContainerRef = React.useRef<HTMLDivElement>(null);
+  const annotationFileRef = React.useRef<HTMLInputElement>(null);
+  const [pendingAnnotation, setPendingAnnotation] = useState<{ x: number, y: number, isDiagram: boolean, itemId?: string, itemType?: ListType } | null>(null);
 
   const handleAddGroup = (name: string) => {
     if (!name.trim()) return;
@@ -824,12 +1100,14 @@ export default function App() {
     }
   };
 
-  const handleImageUpload = (e: React.ChangeEvent<HTMLInputElement>) => {
+  const handleImageUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
     const file = e.target.files?.[0];
     if (file) {
       const reader = new FileReader();
-      reader.onloadend = () => {
-        setDiagramImages(prev => ({ ...prev, [selectedCategory]: reader.result as string }));
+      reader.onloadend = async () => {
+        const rawUrl = reader.result as string;
+        const dataUrl = await compressImage(rawUrl, 2000, 0.8);
+        setDiagramImages(prev => ({ ...prev, [selectedCategory]: dataUrl }));
         setImgConfigs(prev => ({ ...prev, [selectedCategory]: { scale: 1, x: 0, y: 0 } }));
       };
       reader.readAsDataURL(file);
@@ -879,7 +1157,11 @@ export default function App() {
   };
 
   const handleDiagramClick = (e: React.MouseEvent<HTMLDivElement>) => {
-    if (activeTool === 'none') return;
+    isInteractingRef.current = true;
+    if (activeTool === 'none') {
+      isInteractingRef.current = false;
+      return;
+    }
     
     const rect = e.currentTarget.getBoundingClientRect();
     const mx = ((e.clientX - rect.left - (rect.width / 2)) / currentConfig.scale) - currentConfig.x + (rect.width / 2);
@@ -896,8 +1178,16 @@ export default function App() {
       );
       if (nearAnn) {
         removeAnnotation(nearAnn.id);
+        setTimeout(() => { isInteractingRef.current = false; }, 500);
         return;
       }
+    }
+
+    if (activeTool === 'photo') {
+      setPendingAnnotation({ x: px, y: py, isDiagram: true });
+      annotationFileRef.current?.click();
+      setTimeout(() => { isInteractingRef.current = false; }, 500);
+      return;
     }
 
     const newAnn: Annotation = {
@@ -915,7 +1205,10 @@ export default function App() {
 
     if (activeTool === 'text' || activeTool === 'callout') {
       const val = prompt(activeTool === 'text' ? 'Digite o texto:' : 'Digite a letra/número do Callout:');
-      if (!val) return;
+      if (!val) {
+        isInteractingRef.current = false;
+        return;
+      }
       newAnn.text = val.toUpperCase();
     }
 
@@ -923,14 +1216,25 @@ export default function App() {
       ...prev,
       [selectedCategory]: [...(prev[selectedCategory] || []), newAnn]
     }));
+    setTimeout(() => { isInteractingRef.current = false; }, 500);
   };
 
-  const updateAnnotation = (id: string, updates: Partial<Annotation>) => {
-    setDiagramAnnotations(prev => ({
-      ...prev,
-      [selectedCategory]: (prev[selectedCategory] || []).map(a => a.id === id ? { ...a, ...updates } : a)
-    }));
-  };
+  const updateAnnotation = useCallback((id: string, updates: Partial<Annotation>) => {
+    isInteractingRef.current = true;
+    setDiagramAnnotations(prev => {
+      const currentList = prev[selectedCategory] || [];
+      const updatedList = currentList.map(a => 
+        a.id === id ? { ...a, ...updates } : a
+      );
+      if (currentList === updatedList) return prev;
+      return {
+        ...prev,
+        [selectedCategory]: updatedList
+      };
+    });
+    // Set a timeout to release interaction lock shortly after update
+    setTimeout(() => { isInteractingRef.current = false; }, 500);
+  }, [selectedCategory]);
 
   const removeAnnotation = (id: string) => {
     setDiagramAnnotations(prev => ({
@@ -953,8 +1257,9 @@ export default function App() {
     const processFile = (file: File) => {
       return new Promise<void>((resolve) => {
         const reader = new FileReader();
-        reader.onloadend = () => {
-          const base64 = reader.result as string;
+        reader.onloadend = async () => {
+          const rawUrl = reader.result as string;
+          const base64 = await compressImage(rawUrl);
           const fileName = file.name.split('.')[0].toUpperCase();
           
           // Find if this filename matches any existing sheet name (case insensitive)
@@ -1020,6 +1325,7 @@ export default function App() {
   };
 
   const handleMouseDown = (e: React.MouseEvent) => {
+    isInteractingRef.current = true;
     if (activeTool !== 'none') return;
     if (e.button === 0 && (e.altKey || currentConfig.scale > 1)) {
       setIsPanning(true);
@@ -1028,22 +1334,50 @@ export default function App() {
   };
 
   const handleAnnMouseDown = (e: React.MouseEvent, ann: Annotation) => {
+    isInteractingRef.current = true;
     e.stopPropagation();
     setDraggingAnnId(ann.id);
-    const rect = diagramContainerRef.current?.getBoundingClientRect();
-    if (!rect) return;
+    setIsHighlightDragging(highlightState.isOpen);
     
-    const mx = ((e.clientX - rect.left - (rect.width / 2)) / currentConfig.scale) - currentConfig.x + (rect.width / 2);
-    const my = ((e.clientY - rect.top - (rect.height / 2)) / currentConfig.scale) - currentConfig.y + (rect.height / 2);
-    const px = (mx / rect.width) * 1000;
-    const py = (my / rect.height) * 1000;
-
-    setDragOffset({ x: px - ann.x, y: py - ann.y });
+    // We need to know which container we are in to calculate coordinates correctly
+    const container = highlightState.isOpen ? highlightModalRef.current : diagramContainerRef.current;
+    const rect = container?.getBoundingClientRect();
+    if (!rect) return;
+    interactionRectRef.current = rect;
+    
+    // For highlight modal, we use fixed 1000x1000 viewBox coordinate system
+    if (highlightState.isOpen) {
+      const px = (e.clientX - rect.left) / rect.width * 1000;
+      const py = (e.clientY - rect.top) / rect.height * 1000;
+      setDragOffset({ x: px - ann.x, y: py - ann.y });
+    } else {
+      const mx = ((e.clientX - rect.left - (rect.width / 2)) / currentConfig.scale) - currentConfig.x + (rect.width / 2);
+      const my = ((e.clientY - rect.top - (rect.height / 2)) / currentConfig.scale) - currentConfig.y + (rect.height / 2);
+      const px = (mx / rect.width) * 1000;
+      const py = (my / rect.height) * 1000;
+      setDragOffset({ x: px - ann.x, y: py - ann.y });
+    }
   };
 
   const handleMouseMove = (e: React.MouseEvent) => {
     if (draggingAnnId) {
-      const rect = diagramContainerRef.current?.getBoundingClientRect();
+      if (isHighlightDragging && activeHighlightItem) {
+        const rect = interactionRectRef.current;
+        if (!rect) return;
+        const px = (e.clientX - rect.left) / rect.width * 1000;
+        const py = (e.clientY - rect.top) / rect.height * 1000;
+        
+        const newX = px - dragOffset.x;
+        const newY = py - dragOffset.y;
+        
+        const updated = (activeHighlightItem.annotations || []).map(a => 
+          a.id === draggingAnnId ? { ...a, x: newX, y: newY } : a
+        );
+        updateItemAnnotations(activeHighlightItem.part.id, activeHighlightItem.type, updated);
+        return;
+      }
+
+      const rect = interactionRectRef.current || diagramContainerRef.current?.getBoundingClientRect();
       if (!rect) return;
 
       const mx = ((e.clientX - rect.left - (rect.width / 2)) / currentConfig.scale) - currentConfig.x + (rect.width / 2);
@@ -1110,11 +1444,19 @@ export default function App() {
     setLastMousePos({ x: e.clientX, y: e.clientY });
   };
 
-  const handleMouseUp = () => {
+  const handleMouseUp = useCallback(() => {
+    isInteractingRef.current = false;
     setIsPanning(false);
     setDraggingAnnId(null);
     setResizingAnnId(null);
-  };
+    setIsHighlightDragging(false);
+    interactionRectRef.current = null;
+  }, []);
+
+  useEffect(() => {
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => window.removeEventListener('mouseup', handleMouseUp);
+  }, [handleMouseUp]);
 
   const handleDeleteImage = () => {
     if (currentConfig.isLocked) {
@@ -1136,6 +1478,46 @@ export default function App() {
       return matchesSearch;
     });
   }, [searchTerm, selectedGroup, selectedCategory, customParts]);
+
+  const handleAnnotationPhotoUpload = async (e: React.ChangeEvent<HTMLInputElement>) => {
+    const file = e.target.files?.[0];
+    if (!file || !pendingAnnotation) return;
+
+    const reader = new FileReader();
+    reader.onloadend = async () => {
+      const base64 = await compressImage(reader.result as string);
+      
+      const newAnn: Annotation = {
+        id: `ann-${Date.now()}`,
+        type: 'photo',
+        x: pendingAnnotation.x,
+        y: pendingAnnotation.y,
+        width: 150,
+        height: 150,
+        rotation: 0,
+        color: activeColor,
+        photoUrl: base64,
+        strokeWidth: 4
+      };
+
+      if (pendingAnnotation.isDiagram) {
+        setDiagramAnnotations(prev => ({
+          ...prev,
+          [selectedCategory]: [...(prev[selectedCategory] || []), newAnn]
+        }));
+      } else if (pendingAnnotation.itemId && pendingAnnotation.itemType) {
+        const item = selectedItems.find(i => i.part.id === pendingAnnotation.itemId && i.type === pendingAnnotation.itemType);
+        if (item) {
+          updateItemAnnotations(item.part.id, item.type, [...(item.annotations || []), newAnn]);
+        }
+      }
+      
+      setPendingAnnotation(null);
+      setActiveTool('none');
+      if (e.target) e.target.value = '';
+    };
+    reader.readAsDataURL(file);
+  };
 
   const clearCurrentCategoryParts = () => {
     // Only allow clearing custom parts
@@ -1306,9 +1688,9 @@ export default function App() {
     }]);
   };
 
-  const updateItemQuantity = (partId: string, type: ListType, delta: number) => {
+  const updateItemQuantity = (partId: string, delta: number) => {
     setSelectedItems(prev => prev.map(item => {
-      if (item.part.id === partId && item.type === type) {
+      if (item.part.id === partId) {
         return { ...item, quantity: Math.max(1, (item.quantity || 1) + delta) };
       }
       return item;
@@ -1324,14 +1706,29 @@ export default function App() {
     }));
   };
 
-  const updateItemAnnotations = (partId: string, type: ListType, annotations: Annotation[]) => {
-    setSelectedItems(prev => prev.map(item => {
-      if (item.part.id === partId && item.type === type) {
-        return { ...item, annotations };
-      }
-      return item;
-    }));
-  };
+  // Throttled update for annotations to keep UI responsive
+  const updateTimeoutRef = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const updateItemAnnotations = useCallback((partId: string, type: ListType, annotations: Annotation[]) => {
+    isInteractingRef.current = true;
+    
+    // Clear previous if any
+    if (updateTimeoutRef.current) clearTimeout(updateTimeoutRef.current);
+
+    // Immediate update for UI responsiveness
+    setSelectedItems(prev => {
+      const index = prev.findIndex(item => item.part.id === partId && item.type === type);
+      if (index === -1) return prev;
+      const newItems = [...prev];
+      newItems[index] = { ...prev[index], annotations };
+      return newItems;
+    });
+
+    // Release interaction lock after a delay
+    updateTimeoutRef.current = setTimeout(() => {
+      isInteractingRef.current = false;
+      updateTimeoutRef.current = null;
+    }, 500);
+  }, []);
 
   const isSelected = (partId: string, type: ListType) => {
     return selectedItems.some(item => item.part.id === partId && item.type === type);
@@ -1716,6 +2113,13 @@ export default function App() {
 
   return (
     <div className="min-h-screen bg-[#0A0A0A] text-zinc-100 font-sans selection:bg-landcros/30 bg-mining overflow-hidden">
+      <input 
+        type="file" 
+        ref={annotationFileRef} 
+        className="hidden" 
+        accept="image/*" 
+        onChange={handleAnnotationPhotoUpload} 
+      />
       {/* Sidebar / Navigation */}
       <motion.div 
         initial={false}
@@ -2585,255 +2989,146 @@ export default function App() {
             </div>
 
             <div className="flex-1 flex flex-col md:flex-row overflow-hidden relative">
-              {/* Master Tag */}
-              <div className="absolute left-0 top-1/2 -translate-y-1/2 z-50 pointer-events-none">
-                <div className="bg-[#00D154] text-white text-[8px] font-black uppercase tracking-tighter px-2 py-1 rounded-r-md shadow-lg">
-                  MASTER
-                </div>
-              </div>
-
               {/* Left Side: Visual Diagram Area */}
               <div className="flex-1 bg-white relative overflow-hidden flex flex-col">
                   {viewMode === 'visual' && (
-                    <>
-                      {/* Top Labels */}
-                      <div className="absolute top-6 left-6 z-10 pointer-events-none">
-                        <div className="flex items-center gap-3">
-                          <h2 className="text-2xl font-black tracking-tighter text-black uppercase italic">
-                            {selectedCategory}
-                          </h2>
-                          <div className="flex gap-1">
-                             {isAdmin && (
-                               <>
-                                 <button className="p-1.5 bg-zinc-100 rounded-md text-zinc-400 hover:text-zinc-600 pointer-events-auto"><Trash2 size={12}/></button>
-                                 <button className="p-1.5 bg-zinc-100 rounded-md text-zinc-400 hover:text-zinc-600 pointer-events-auto"><Wrench size={12}/></button>
-                                 <button className="p-1.5 bg-red-50 rounded-md text-red-400 pointer-events-auto"><Eye size={12}/></button>
-                               </>
-                             )}
+                    <div className="flex-1 flex flex-col overflow-hidden">
+                      {/* Diagram Annotation Tools (Static Header Bar) */}
+                      <AnimatePresence>
+                        {isDiagramToolbarVisible && isAdmin && (
+                          <motion.div 
+                            initial={{ height: 0, opacity: 0 }}
+                            animate={{ height: 'auto', opacity: 1 }}
+                            exit={{ height: 0, opacity: 0 }}
+                            className="bg-zinc-50/80 backdrop-blur-md border-b border-zinc-200 px-6 py-2 flex items-center justify-between z-[60] shrink-0 overflow-hidden shadow-sm"
+                          >
+                            <div className="flex items-center gap-6">
+                              <div className="bg-[#00D154] text-white text-[8px] font-black uppercase tracking-tighter px-2 py-1 rounded shadow-sm">
+                                MASTER
+                              </div>
+                              <div className="flex items-center gap-2 pr-6 border-r border-zinc-200 ml-[-8px]">
+                                {['#000000', '#f27d26', '#ef4444', '#22c55e'].map(c => (
+                                  <button
+                                    key={c}
+                                    onClick={() => setActiveColor(c)}
+                                    className={`w-6 h-6 rounded-full border-2 transition-all ${activeColor === c ? 'border-zinc-800 scale-110 shadow-md' : 'border-transparent opacity-60'}`}
+                                    style={{ backgroundColor: c }}
+                                  />
+                                ))}
+                              </div>
+                              <div className="flex items-center gap-1">
+                                {[
+                                  { id: 'none', icon: MousePointer2, label: 'Mouse' },
+                                  { id: 'circle', icon: Target, label: 'Círculo' },
+                                  { id: 'arrow', icon: Navigation, label: 'Seta' },
+                                  { id: 'box', icon: Square, label: 'Box' },
+                                  { id: 'text', icon: Type, label: 'Texto' },
+                                  { id: 'photo', icon: ImageIcon, label: 'Foto' },
+                                  { id: 'eraser', icon: Eraser, label: 'Borracha' }
+                                ].map(tool => (
+                                  <button
+                                    key={tool.id}
+                                    onClick={() => setActiveTool(tool.id as AnnotationType)}
+                                    className={`px-3 py-2 rounded-lg flex items-center gap-2 transition-all ${
+                                      activeTool === tool.id 
+                                        ? 'bg-landcros text-white shadow-md' 
+                                        : 'text-zinc-500 hover:text-zinc-800 hover:bg-zinc-100'
+                                    }`}
+                                  >
+                                    <tool.icon size={14} className={tool.id === 'arrow' ? 'rotate-45' : ''} />
+                                    <span className="text-[10px] font-black uppercase tracking-tight">{tool.label}</span>
+                                  </button>
+                                ))}
+                              </div>
+                            </div>
+
+                            <div className="flex items-center gap-2">
+                              <p className={`text-[9px] font-bold uppercase tracking-widest ${saveStatus === 'error' ? 'text-red-500' : 'text-zinc-400'}`}>
+                                {saveStatus === 'saving' ? 'Salvando...' : saveStatus === 'error' ? 'Erro de Armazenamento' : 'Sincronizado'}
+                              </p>
+                              <div className={`w-2 h-2 rounded-full ${saveStatus === 'saving' ? 'bg-amber-400 animate-pulse' : saveStatus === 'error' ? 'bg-red-500' : 'bg-green-500 animate-pulse duration-[3000ms]'}`} />
+                            </div>
+                          </motion.div>
+                        )}
+                      </AnimatePresence>
+
+                      <div className="flex-1 relative flex flex-col overflow-hidden">
+                        {/* Top Labels */}
+                        <div className="absolute top-6 left-6 z-20 pointer-events-none">
+                          <div className="flex items-center gap-3">
+                            <h2 className="text-2xl font-black tracking-tighter text-black uppercase italic">
+                              {selectedCategory}
+                            </h2>
+                            <div className="flex gap-2 pointer-events-auto">
+                               {isAdmin && (
+                                 <button 
+                                   onClick={() => setIsDiagramToolbarVisible(!isDiagramToolbarVisible)}
+                                   className={`p-2 rounded-lg transition-all flex items-center gap-2 ${isDiagramToolbarVisible ? 'bg-zinc-800 text-white' : 'bg-landcros text-white shadow-lg shadow-landcros/20'}`}
+                                 >
+                                   <Wrench size={14}/>
+                                   <span className="text-[10px] font-bold uppercase">{isDiagramToolbarVisible ? 'Esconder' : 'Ferramentas'}</span>
+                                 </button>
+                               )}
+                            </div>
+                          </div>
+                          <div className="flex items-center gap-2 mt-1">
+                            <p className="text-[10px] font-mono text-zinc-400 uppercase tracking-widest font-bold">Diagrama Técnico</p>
+                            <div className="w-1 h-1 rounded-full bg-zinc-300" />
+                            <span className="text-[8px] bg-red-100 text-red-500 px-2 py-0.5 rounded-full font-black uppercase tracking-tight">Oculto para usuário</span>
                           </div>
                         </div>
-                        <div className="flex items-center gap-2 mt-1">
-                          <p className="text-[9px] font-mono text-zinc-400 uppercase tracking-[0.2em]">Diagrama Técnico</p>
-                          <div className="w-1 h-1 rounded-full bg-zinc-300" />
-                          <span className="text-[7px] bg-red-100 text-red-500 px-1.5 py-0.5 rounded font-black uppercase tracking-tighter">Oculto para usuário</span>
-                          <div className="w-1 h-1 rounded-full bg-zinc-300" />
-                          <p className={`text-[8px] font-bold uppercase tracking-widest ${saveStatus === 'error' ? 'text-red-500' : 'text-zinc-400'}`}>
-                            {saveStatus === 'saving' ? 'Salvando...' : saveStatus === 'error' ? 'Memória Cheia!' : 'Sincronizado'}
-                          </p>
-                        </div>
-                      </div>
 
-                      {/* Diagram Container */}
-                      <div 
-                        ref={diagramContainerRef}
-                        onWheel={handleWheel}
-                        onMouseDown={handleMouseDown}
-                        onMouseMove={handleMouseMove}
-                        onMouseUp={handleMouseUp}
-                        onMouseLeave={handleMouseUp}
-                        onClick={handleDiagramClick}
-                        className={`flex-1 relative flex items-center justify-center overflow-hidden bg-white ${isPanning ? 'cursor-grabbing' : currentConfig.scale > 1 ? 'cursor-grab' : activeTool !== 'none' ? 'cursor-crosshair' : ''}`}
-                      >
-                         {/* Annotation Layer */}
-                         <div 
-                           className="absolute inset-0 z-20 pointer-events-none"
-                           style={{
-                             transform: `translate(${currentConfig.x}px, ${currentConfig.y}px) scale(${currentConfig.scale})`,
-                             transformOrigin: 'center'
-                           }}
-                         >
-                           <svg viewBox="0 0 1000 1000" className="w-full h-full">
-                             {(diagramAnnotations[selectedCategory] || []).map(ann => {
-                               const isMagnifier = ann.type === 'crop-circle';
-                               if (ann.type === 'circle' || isMagnifier) {
-                                 return (
-                                   <g key={ann.id} className="pointer-events-auto cursor-move">
-                                      {isMagnifier && (
-                                        <defs>
-                                          <clipPath id={`clip-${ann.id}`}>
-                                            <circle cx={ann.x} cy={ann.y} r={ann.width! / 2} />
-                                          </clipPath>
-                                        </defs>
-                                      )}
-                                      
-                                      <circle 
-                                        cx={ann.x} cy={ann.y} r={ann.width! / 2} 
-                                        fill={isMagnifier ? "none" : "rgba(255,255,255,0.05)"} 
-                                        stroke={ann.color} strokeWidth="4" 
-                                        onMouseDown={(e) => handleAnnMouseDown(e, ann)}
-                                      />
-                                      
-                                      {isMagnifier && (
-                                        <g clipPath={`url(#clip-${ann.id})`}>
-                                          <image 
-                                            href={currentImg || (currentSheet?.photo ? `/${currentSheet.photo}` : `/${selectedCategory}.png`)} 
-                                            x={ann.x - (ann.x * 2)} 
-                                            y={ann.y - (ann.y * 2)} 
-                                            width="2000" 
-                                            height="2000"
-                                            style={{
-                                              transform: `translate(${ann.x}px, ${ann.y}px) scale(2) translate(${-ann.x}px, ${-ann.y}px)`,
-                                              filter: isBlueprintMode ? 'invert(1) brightness(2)' : 'none'
-                                            }}
-                                          />
-                                        </g>
-                                      )}
-
-                                      {!isMagnifier && (
-                                        <text 
-                                          x={ann.x} y={ann.y - (ann.width! / 2) - 10} 
-                                          fill={ann.color} fontSize="12" fontWeight="900" 
-                                          textAnchor="middle" className="uppercase tracking-widest"
-                                        >
-                                          Detalhe
-                                        </text>
-                                      )}
-                                      
-                                      {isAdmin && (
-                                        <circle 
-                                          cx={ann.x + (ann.width!/2)} cy={ann.y} r="8" 
-                                          fill="white" stroke={ann.color} className="cursor-nesw-resize" 
-                                          onMouseDown={(e) => {
-                                             e.stopPropagation();
-                                             setResizingAnnId(ann.id);
-                                          }}
-                                        />
-                                      )}
-                                   </g>
-                                 );
-                               }
-                               if (ann.type === 'box') {
-                                 return (
-                                   <g key={ann.id} className="pointer-events-auto cursor-move">
-                                     <rect 
-                                       x={ann.x - ann.width!/2} y={ann.y - ann.height!/2}
-                                       width={ann.width} height={ann.height}
-                                       fill="rgba(255,255,255,0.05)" stroke={ann.color} strokeWidth="4"
-                                       onMouseDown={(e) => handleAnnMouseDown(e, ann)}
-                                     />
-                                     {isAdmin && (
-                                       <circle 
-                                         cx={ann.x + (ann.width!/2)} cy={ann.y + (ann.height!/2)} r="8" 
-                                         fill="white" stroke={ann.color} className="cursor-nwse-resize" 
-                                         onMouseDown={(e) => {
-                                            e.stopPropagation();
-                                            setResizingAnnId(ann.id);
-                                         }}
-                                       />
-                                     )}
-                                   </g>
-                                 );
-                               }
-                               if (ann.type === 'text' || ann.type === 'callout') {
-                                 const isCallout = ann.type === 'callout';
-                                 return (
-                                   <g key={ann.id} className="pointer-events-auto cursor-move" onMouseDown={(e) => handleAnnMouseDown(e, ann)}>
-                                     {isCallout && (
-                                       <circle 
-                                         cx={ann.x} cy={ann.y} r="20" 
-                                         fill="white" stroke={ann.color} strokeWidth="2" 
-                                       />
-                                     )}
-                                     <text 
-                                       x={ann.x} y={isCallout ? ann.y + 5 : ann.y} 
-                                       fill={isCallout ? "black" : ann.color} 
-                                       fontSize={isCallout ? "14" : (ann.fontSize || 14)} 
-                                       fontWeight="900" 
-                                       textAnchor="middle" 
-                                       className="uppercase tracking-widest pointer-events-none select-none"
-                                     >
-                                       {ann.text}
-                                     </text>
-                                     {isAdmin && !isCallout && (
-                                        <g className="cursor-ns-resize" onMouseDown={(e) => {
-                                          e.stopPropagation();
-                                          setResizingAnnId(ann.id);
-                                        }}>
-                                          <circle cx={ann.x + 40} cy={ann.y} r="6" fill="white" stroke={ann.color} />
-                                        </g>
-                                     )}
-                                   </g>
-                                 );
-                               }
-                               if (ann.type === 'arrow') {
-                                  return (
-                                    <g key={ann.id} className="pointer-events-auto cursor-move">
-                                      <line 
-                                        x1={ann.x} y1={ann.y} 
-                                        x2={ann.x + Math.cos(ann.rotation!) * ann.width!} 
-                                        y2={ann.y + Math.sin(ann.rotation!) * ann.width!} 
-                                        stroke={ann.color} strokeWidth="6" markerEnd={`url(#arrowhead-${ann.id})`}
-                                        onMouseDown={(e) => handleAnnMouseDown(e, ann)}
-                                      />
-                                      <defs>
-                                        <marker id={`arrowhead-${ann.id}`} markerWidth="10" markerHeight="7" refX="9" refY="3.5" orientation="auto">
-                                          <polygon points="0 0, 10 3.5, 0 7" fill={ann.color} />
-                                        </marker>
-                                      </defs>
-                                      {isAdmin && (
-                                        <circle 
-                                          cx={ann.x + Math.cos(ann.rotation!) * ann.width!} 
-                                          cy={ann.y + Math.sin(ann.rotation!) * ann.width!} 
-                                          r="8" fill="white" stroke={ann.color} className="cursor-pointer"
-                                          onMouseDown={(e) => {
-                                            e.stopPropagation();
-                                            // Handle arrow scaling/rotation separately if needed, but for now we'll allow basic move
-                                            setResizingAnnId(ann.id);
-                                          }}
-                                        />
-                                      )}
-                                    </g>
-                                  );
-                                }
-                                if (ann.type === 'eraser') {
-                                 return (
-                                   <rect 
-                                     key={ann.id}
-                                     x={ann.x - ann.width!/2} y={ann.y - ann.height!/2} 
-                                     width={ann.width} height={ann.height} 
-                                     fill={isBlueprintMode ? "black" : "white"} 
-                                     className="pointer-events-auto cursor-move"
-                                     onMouseDown={(e) => handleAnnMouseDown(e, ann)}
-                                   />
-                                 );
-                               }
-                               if (ann.type === 'leader') {
-                                 return (
-                                   <line 
-                                     key={ann.id}
-                                     x1={ann.x} y1={ann.y} x2={ann.x + 100} y2={ann.y + 100} 
-                                     stroke={ann.color} strokeWidth="3" strokeDasharray="8,8"
-                                     className="pointer-events-auto cursor-move"
-                                     onMouseDown={(e) => handleAnnMouseDown(e, ann)}
-                                   />
-                                 );
-                               }
-                               return null;
-                             })}
-                           </svg>
-                         </div>
-                         {/* Reset Zoom Button */}
-                         <AnimatePresence>
-                          {(currentConfig.scale !== (savedConfigs[selectedCategory]?.scale || 1) || 
-                            currentConfig.x !== (savedConfigs[selectedCategory]?.x || 0) || 
-                            currentConfig.y !== (savedConfigs[selectedCategory]?.y || 0)) && (
-                            <motion.button
-                              initial={{ opacity: 0, scale: 0.8, y: 20 }}
-                              animate={{ opacity: 1, scale: 1, y: 0 }}
-                              exit={{ opacity: 0, scale: 0.8, y: 20 }}
-                              onClick={(e) => {
-                                e.stopPropagation();
-                                handleResetZoom();
-                              }}
-                              className="absolute bottom-6 right-6 z-40 p-4 bg-zinc-900/90 backdrop-blur-xl border border-white/10 rounded-2xl text-landcros hover:bg-landcros hover:text-white transition-all shadow-2xl group flex items-center gap-2"
-                              title="Resetar para Configuração Mestre"
+                        {/* Diagram Container */}
+                        <div 
+                          ref={diagramContainerRef}
+                          onWheel={handleWheel}
+                          onMouseDown={handleMouseDown}
+                          onMouseMove={handleMouseMove}
+                          onMouseUp={handleMouseUp}
+                          onMouseLeave={handleMouseUp}
+                          className={`flex-1 relative flex items-center justify-center overflow-hidden bg-white ${isPanning ? 'cursor-grabbing' : currentConfig.scale > 1 ? 'cursor-grab' : activeTool !== 'none' ? 'cursor-crosshair' : ''}`}
+                        >
+                          {/* Floating Annotation Settings Floater (Diagram) */}
+                        <AnimatePresence>
+                          {highlightState.activeAnnId && diagramAnnotations[selectedCategory]?.find(a => a.id === highlightState.activeAnnId) && (
+                            <motion.div 
+                              initial={{ opacity: 0, y: 20 }}
+                              animate={{ opacity: 1, y: 0 }}
+                              exit={{ opacity: 0, y: 20 }}
+                              className="absolute right-6 bottom-24 w-56 bg-white border border-zinc-200 rounded-[28px] p-5 shadow-2xl z-50 space-y-4"
                             >
-                              <RotateCcw size={18} className="group-hover:rotate-[-45deg] transition-transform" />
-                              <span className="text-[10px] font-black uppercase tracking-widest pr-1">Configuração Mestre</span>
-                            </motion.button>
+                              <div className="flex items-center justify-between border-b border-zinc-50 pb-3 mb-1">
+                                <div className="flex items-center gap-2">
+                                  <Settings size={14} className="text-landcros" />
+                                  <span className="text-[10px] font-black text-black uppercase tracking-tight">Editar Marcação</span>
+                                </div>
+                                <button onClick={() => setHighlightState(prev => ({ ...prev, activeAnnId: null }))} className="text-zinc-300 hover:text-zinc-500 transition-colors"><X size={16}/></button>
+                              </div>
+                              
+                              {/* Thickness slider for diagram */}
+                              <PropertySlider 
+                                label="Espessura"
+                                value={diagramAnnotations[selectedCategory]?.find(a => a.id === highlightState.activeAnnId)?.strokeWidth || 8}
+                                min={1}
+                                max={40}
+                                unit="px"
+                                onInteractionStart={() => { isInteractingRef.current = true; }}
+                                onInteractionEnd={() => { isInteractingRef.current = false; }}
+                                onChange={(val) => updateAnnotation(highlightState.activeAnnId!, { strokeWidth: val })}
+                              />
+
+                              <button 
+                                onClick={() => {
+                                  removeAnnotation(highlightState.activeAnnId!);
+                                  setHighlightState(prev => ({ ...prev, activeAnnId: null }));
+                                }}
+                                className="w-full py-3 bg-red-50 text-red-500 hover:bg-red-500 hover:text-white rounded-xl text-[9px] font-black uppercase tracking-widest transition-all"
+                              >
+                                Excluir Marcação
+                              </button>
+                            </motion.div>
                           )}
                         </AnimatePresence>
-
                         <div 
                           ref={innerContainerRef}
                           className="relative flex items-center justify-center"
@@ -2848,11 +3143,12 @@ export default function App() {
                           }}
                         >
                           <img 
-                            src={currentImg || (currentSheet?.photo ? `/${currentSheet.photo}` : `/${selectedCategory}.png`)} 
+                            src={imageBlobUrls[selectedCategory] || currentImg || (currentSheet?.photo ? `/${currentSheet.photo}` : `/${selectedCategory}.png`)} 
                             alt={selectedCategory}
+                            onClick={handleDiagramClick}
                             className="w-full h-full object-contain transition-opacity duration-300" 
                             onError={(e) => {
-                              if (!currentImg) {
+                              if (!currentImg && !imageBlobUrls[selectedCategory]) {
                                 (e.target as HTMLImageElement).style.opacity = '0';
                               }
                             }}
@@ -2866,6 +3162,65 @@ export default function App() {
                               mixBlendMode: isBlueprintMode ? 'screen' : 'normal',
                             }}
                           />
+                          
+                          {/* Diagram Annotations Layer */}
+                          <div className="absolute inset-0 pointer-events-none">
+                            <svg viewBox="0 0 1000 1000" className="w-full h-full">
+                              {(diagramAnnotations[selectedCategory] || []).map(ann => (
+                                <g key={ann.id} className="pointer-events-auto cursor-pointer" 
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setHighlightState(prev => ({ ...prev, activeAnnId: ann.id }));
+                                  }}
+                                  onMouseDown={(e) => handleAnnMouseDown(e, ann)}
+                                >
+                                  {ann.type === 'circle' && (
+                                    <circle cx={ann.x} cy={ann.y} r={ann.width!/2} fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth || 8} />
+                                  )}
+                                  {ann.type === 'arrow' && (
+                                    <g stroke={ann.color} strokeWidth={ann.strokeWidth || 8} fill="none">
+                                      <line x1={ann.x} y1={ann.y} x2={ann.x + Math.cos(ann.rotation || 0) * ann.width!} y2={ann.y + Math.sin(ann.rotation || 0) * ann.width!} />
+                                      <path 
+                                        d={`M ${ann.x + Math.cos(ann.rotation || 0) * ann.width!} ${ann.y + Math.sin(ann.rotation || 0) * ann.width!} l ${-(ann.strokeWidth || 8) * 2 * Math.cos((ann.rotation || 0) - Math.PI/6)} ${-(ann.strokeWidth || 8) * 2 * Math.sin((ann.rotation || 0) - Math.PI/6)} m ${(ann.strokeWidth || 8) * 2 * Math.cos((ann.rotation || 0) - Math.PI/6)} ${(ann.strokeWidth || 8) * 2 * Math.sin((ann.rotation || 0) - Math.PI/6)} l ${-(ann.strokeWidth || 8) * 2 * Math.cos((ann.rotation || 0) + Math.PI/6)} ${-(ann.strokeWidth || 8) * 2 * Math.sin((ann.rotation || 0) + Math.PI/6)}`} 
+                                        stroke={ann.color} 
+                                        strokeWidth={ann.strokeWidth || 8} 
+                                        strokeLinecap="round" 
+                                        strokeLinejoin="round" 
+                                      />
+                                    </g>
+                                  )}
+                                  {ann.type === 'box' && (
+                                    <rect x={ann.x - ann.width!/2} y={ann.y - ann.height!/2} width={ann.width} height={ann.height} fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth || 8} />
+                                  )}
+                                  {ann.type === 'text' && (
+                                    <text x={ann.x} y={ann.y} fill={ann.color} fontSize={ann.fontSize || 24} fontWeight="900" textAnchor="middle" alignmentBaseline="middle">{ann.text}</text>
+                                  )}
+                                  {ann.type === 'photo' && ann.photoUrl && (
+                                    <g>
+                                      <defs>
+                                        <clipPath id={`photo-clip-${ann.id}`}>
+                                          <circle cx={ann.x} cy={ann.y} r={(ann.width || 0)/2} />
+                                        </clipPath>
+                                      </defs>
+                                      <image 
+                                        href={ann.photoUrl} 
+                                        x={ann.x - (ann.width || 0)/2} 
+                                        y={ann.y - (ann.width || 0)/2} 
+                                        width={ann.width} 
+                                        height={ann.width} 
+                                        clipPath={`url(#photo-clip-${ann.id})`}
+                                        preserveAspectRatio="xMidYMid slice"
+                                      />
+                                      <circle cx={ann.x} cy={ann.y} r={(ann.width || 0)/2} fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth || 4} />
+                                    </g>
+                                  )}
+                                  {highlightState.activeAnnId === ann.id && (
+                                    <circle cx={ann.x} cy={ann.y} r={(ann.width || 0)/2 + 10} fill="none" stroke="rgba(242,125,38,0.5)" strokeWidth="2" strokeDasharray="5,5" />
+                                  )}
+                                </g>
+                              ))}
+                            </svg>
+                          </div>
                           {!currentImg && (
                             <div className="absolute inset-0 flex flex-col items-center justify-center opacity-10 pointer-events-none p-12 text-center -z-10">
                               <MapIcon size={48} className="mb-4 text-black" />
@@ -2876,11 +3231,12 @@ export default function App() {
                           )}
                         </div>
                       </div>
-                    </>
-                  )}
+                    </div>
+                  </div>
+                )}
 
                 {viewMode === 'bom' && (
-                  <div className="flex-1 bg-[#141414] p-8 overflow-y-auto">
+                    <div className="flex-1 bg-[#141414] p-8 overflow-y-auto">
                     <div className="flex items-center justify-between mb-8">
                       <div>
                         <h2 className="text-3xl font-black text-white italic uppercase tracking-tighter">
@@ -3038,7 +3394,7 @@ export default function App() {
                     animate={{ x: 0, opacity: 1 }}
                     exit={{ x: 400, opacity: 0 }}
                     transition={{ type: 'spring', damping: 25, stiffness: 200 }}
-                    className="w-full md:w-[320px] bg-[#141414] border-l border-white/5 flex flex-col shrink-0 z-30"
+                    className="w-full md:w-[360px] bg-[#141414] border-l border-white/5 flex flex-col shrink-0 z-30"
                   >
                     {/* Sidebar Tabs */}
                     <div className="flex items-center gap-1.5 mx-4 mt-2">
@@ -3073,7 +3429,7 @@ export default function App() {
                         <button 
                           onClick={() => setIsSidebarCollapsed(!isSidebarCollapsed)}
                           className={`p-1.5 rounded-lg border transition-all ${isSidebarCollapsed ? 'bg-landcros/20 text-landcros border-landcros/30' : 'bg-white/5 text-zinc-500 border-white/10 hover:bg-white/10'}`}
-                          title="Tela Cheia"
+                          title="Recolher Diagrama"
                         >
                           <Maximize2 size={12} />
                         </button>
@@ -3087,327 +3443,322 @@ export default function App() {
                       </div>
                     </div>
 
-                    {/* Sidebar Controls */}
-                    <div className="px-4 space-y-3 flex-1 overflow-y-auto pb-4 scrollbar-thin scrollbar-thumb-white/10">
-                      <div className="bg-landcros p-0.5 rounded-lg flex items-center gap-0.5 shadow-lg shadow-landcros/20 relative group/controls">
-                        <button onClick={() => setImgConfigs(prev => ({ ...prev, [selectedCategory]: { ...currentConfig, scale: currentConfig.scale + 0.1 } }))} className="flex-1 py-1 hover:bg-white/10 rounded-md text-white flex justify-center transition-colors"><Plus size={14}/></button>
+                    {/* Sidebar Controls - Improved Scroll */}
+                    <div className="px-4 mt-4 space-y-4 flex-1 overflow-y-auto pb-6 scrollbar-hide">
+                      
+                      {/* COMANDOS DE IMAGEM (Portuguese Requested Panel - Compact Edition) */}
+                      <div className="bg-landcros p-0.5 rounded-xl flex items-center gap-0.5 shadow-lg shadow-landcros/20 group/controls relative">
+                        <button 
+                          onClick={() => setImgConfigs(prev => ({ ...prev, [selectedCategory]: { ...currentConfig, scale: currentConfig.scale + 0.1 } }))}
+                          className="flex-1 h-[32px] hover:bg-white/10 rounded-lg text-white flex justify-center items-center transition-colors"
+                          title="Aumentar"
+                        >
+                          <Plus size={16} />
+                        </button>
+                        <button 
+                          onClick={() => setImgConfigs(prev => ({ ...prev, [selectedCategory]: { ...currentConfig, scale: Math.max(0.1, currentConfig.scale - 0.1) } }))}
+                          className="flex-1 h-[32px] hover:bg-white/10 rounded-lg text-white flex justify-center items-center transition-colors"
+                          title="Diminuir"
+                        >
+                          <Minus size={16} />
+                        </button>
                         <div className="w-px h-3 bg-white/20" />
-                        <button onClick={() => setImgConfigs(prev => ({ ...prev, [selectedCategory]: { ...currentConfig, scale: Math.max(0.1, currentConfig.scale - 0.1) } }))} className="flex-1 py-1 hover:bg-white/10 rounded-md text-white flex justify-center transition-colors"><Minus size={14}/></button>
-                        <div className="w-px h-3 bg-white/20" />
-                        <button onClick={() => setImgConfigs(prev => ({ ...prev, [selectedCategory]: { ...currentConfig, rotation: (currentConfig.rotation || 0) + 90 } }))} className="flex-1 py-1 hover:bg-white/10 rounded-md text-white flex justify-center transition-colors"><RotateCcw size={14}/></button>
-                        <div className="w-px h-3 bg-white/20" />
-                        <button onClick={handleResetZoom} className="flex-[2] py-1 hover:bg-white/10 rounded-md text-white flex items-center justify-center gap-2 transition-colors">
-                          <Maximize2 size={12} />
-                          <span className="text-[8px] font-black uppercase tracking-widest">RESET</span>
+                        <button 
+                          onClick={() => setImgConfigs(prev => ({ ...prev, [selectedCategory]: { ...currentConfig, rotation: (currentConfig.rotation || 0) + 90 } }))}
+                          className="flex-1 h-[32px] hover:bg-white/10 rounded-lg text-white flex justify-center items-center transition-colors"
+                          title="Rotacionar"
+                        >
+                          <RotateCcw size={16} />
                         </button>
                         
-                        {/* Quick Action Overlays for Admin */}
-                        {isAdmin && (
-                          <div className="absolute -top-12 left-0 right-0 flex gap-2 justify-center opacity-0 group-hover/controls:opacity-100 transition-opacity">
-                            <button 
-                              onClick={() => setIsAdjusting(!isAdjusting)}
-                              className={`p-2 rounded-xl border transition-all ${isAdjusting ? 'bg-landcros text-white border-landcros' : 'bg-zinc-900/90 text-zinc-400 border-white/10 hover:text-white'}`}
-                              title="Ajustar Imagem"
-                            >
-                              <Wrench size={14} />
-                            </button>
-                            <button 
-                              onClick={() => setIsFiltersVisible(!isFiltersVisible)}
-                              className={`p-2 rounded-xl border transition-all ${isFiltersVisible ? 'bg-landcros text-white border-landcros' : 'bg-zinc-900/90 text-zinc-400 border-white/10 hover:text-white'}`}
-                              title="Ajustes de Cor"
-                            >
-                              <Palette size={14} />
-                            </button>
+                        <div className="w-px h-4 bg-white/10 mx-1" />
+                        
+                        <div className="flex items-center gap-0.5 bg-black/10 rounded-lg p-0.5" title="Deslocamento">
+                          <div className="grid grid-cols-2 gap-0.5">
+                            <button onClick={() => setImgConfigs(prev => ({ ...prev, [selectedCategory]: { ...currentConfig, y: currentConfig.y - 20 } }))} className="w-4 h-4 flex items-center justify-center text-white/60 hover:text-white transition-colors bg-white/5 rounded-sm"><ArrowUp size={8}/></button>
+                            <button onClick={() => setImgConfigs(prev => ({ ...prev, [selectedCategory]: { ...currentConfig, y: currentConfig.y + 20 } }))} className="w-4 h-4 flex items-center justify-center text-white/60 hover:text-white transition-colors bg-white/5 rounded-sm"><ArrowDown size={8}/></button>
+                            <button onClick={() => setImgConfigs(prev => ({ ...prev, [selectedCategory]: { ...currentConfig, x: currentConfig.x - 20 } }))} className="w-4 h-4 flex items-center justify-center text-white/60 hover:text-white transition-colors bg-white/5 rounded-sm"><ArrowLeft size={8}/></button>
+                            <button onClick={() => setImgConfigs(prev => ({ ...prev, [selectedCategory]: { ...currentConfig, x: currentConfig.x + 20 } }))} className="w-4 h-4 flex items-center justify-center text-white/60 hover:text-white transition-colors bg-white/5 rounded-sm"><ArrowRight size={8}/></button>
                           </div>
-                        )}
+                        </div>
+
+                        <div className="w-px h-3 bg-white/20" />
+                        <button 
+                          onClick={handleResetZoom}
+                          className="flex-[2] h-[32px] hover:bg-white/10 rounded-lg text-white flex items-center justify-center gap-1 transition-colors px-2"
+                        >
+                          <Maximize2 size={12} />
+                          <span className="text-[7px] font-black uppercase tracking-widest leading-none">RESET</span>
+                        </button>
+                        
+                        <button 
+                          onClick={() => {
+                            const original = selectedCategory;
+                            setSelectedCategory('');
+                            setTimeout(() => setSelectedCategory(original), 10);
+                          }}
+                          className="absolute -right-1 -top-1 w-4 h-4 bg-zinc-800 border border-white/10 rounded-full flex items-center justify-center text-zinc-500 hover:text-white transition-opacity opacity-0 group-hover/controls:opacity-100"
+                        >
+                          <RotateCw size={8} />
+                        </button>
                       </div>
 
                       {/* Focused Part Details */}
                       {focusedPart && (
                         <motion.div 
-                          initial={{ opacity: 0, y: -20 }}
-                          animate={{ opacity: 1, y: 0 }}
-                          className="bg-zinc-900 border border-white/5 rounded-3xl p-4 space-y-4 shadow-2xl relative"
+                          initial={{ opacity: 0, scale: 0.95 }}
+                          animate={{ opacity: 1, scale: 1 }}
+                          className="bg-zinc-900 border border-white/5 rounded-[32px] p-5 space-y-4 shadow-2xl relative overflow-hidden"
                         >
-                          <div className="flex items-start justify-between mb-2">
-                            <div>
-                              <span className="text-[10px] font-black text-landcros uppercase tracking-[0.2em]">{focusedPart.partNumber}</span>
-                              <h3 className="text-white font-black text-sm uppercase truncate max-w-[200px]">{focusedPart.description}</h3>
+                          <div className="flex items-start justify-between">
+                            <div className="min-w-0">
+                              <span className="text-[10px] font-black text-landcros uppercase tracking-[0.2em] mb-1 block">Focused Part</span>
+                              <h3 className="text-white font-black text-xl uppercase tracking-tighter leading-none" title={focusedPart.partNumber}>{focusedPart.partNumber}</h3>
+                              <p className="text-[10px] text-zinc-600 font-bold italic mt-1 leading-tight">{focusedPart.description}</p>
                             </div>
-                            <button onClick={() => setFocusedPart(null)} className="p-1.5 bg-white/5 text-zinc-500 hover:text-white rounded-full transition-colors"><X size={16}/></button>
+                            <button onClick={() => setFocusedPart(null)} className="p-2 bg-white/5 text-zinc-500 hover:text-white rounded-full transition-all hover:rotate-90 flex-shrink-0 border border-white/5"><X size={16}/></button>
                           </div>
 
-                          {/* Report Button (Prominent) */}
+                          {/* Action Panel Row - Quantity & Order */}
+                          <div className="bg-zinc-950/40 border border-white/5 rounded-[22px] p-2 flex items-center justify-between shadow-inner">
+                            <div className="flex flex-col">
+                              <span className="text-[10px] font-black text-zinc-600 uppercase tracking-[0.2em] leading-none mb-1.5 pl-1">Quantity</span>
+                              <div className="flex items-center gap-4 bg-zinc-900/80 border border-white/5 rounded-xl p-1 shadow-lg">
+                                <button 
+                                  onClick={() => updateItemQuantity(focusedPart.id, -1)}
+                                  className="w-6 h-6 rounded-lg bg-white/5 hover:bg-white/10 flex items-center justify-center text-zinc-400 hover:text-white transition-all active:scale-90"
+                                >
+                                  <Minus size={12} strokeWidth={3} />
+                                </button>
+                                <span className="text-sm font-black text-landcros min-w-[20px] text-center italic">
+                                  {localItemQuantity}
+                                </span>
+                                <button 
+                                  onClick={() => updateItemQuantity(focusedPart.id, 1)}
+                                  className="w-6 h-6 rounded-lg bg-white/5 hover:bg-white/10 flex items-center justify-center text-zinc-400 hover:text-white transition-all active:scale-90"
+                                >
+                                  <Plus size={12} strokeWidth={3} />
+                                </button>
+                              </div>
+                            </div>
+                            <div className="h-8 w-[1px] bg-white/10 mx-3 opacity-20" />
+                            <div className="flex-1">
+                              <button 
+                                onClick={() => toggleItem(focusedPart, 'order')}
+                                className={`w-full h-10 rounded-xl flex flex-col items-center justify-center gap-0.5 transition-all relative overflow-hidden group/order ${
+                                  selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'order')
+                                    ? 'bg-landcros text-white shadow-xl'
+                                    : 'bg-white/5 text-zinc-500 hover:text-white border border-white/5'
+                                }`}
+                              >
+                                <ShoppingCart size={14} className={selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'order') ? 'animate-bounce' : ''} />
+                                <span className="text-[8px] font-black uppercase tracking-widest mt-0.5 whitespace-nowrap">{language === 'pt' ? 'Adicionar ao Pedido' : 'Add to Order'}</span>
+                              </button>
+                            </div>
+                          </div>
+
+                          {/* Damage Toggle Button */}
                           <button 
                             onClick={() => toggleItem(focusedPart, 'damaged')}
-                            className={`w-full py-3.5 rounded-2xl flex items-center justify-between px-5 transition-all shadow-[0_4px_20px_rgba(0,0,0,0.3)] ${
+                            className={`w-full py-2.5 rounded-[20px] flex items-center justify-between px-6 transition-all shadow-xl group/damage ${
                               selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'damaged')
-                                ? 'bg-red-500 text-white ring-2 ring-red-500/50'
-                                : 'bg-zinc-800 text-zinc-400 border border-white/5 hover:bg-zinc-750'
+                                ? 'bg-red-500 text-white shadow-red-500/20'
+                                : 'bg-white/5 text-zinc-500 border border-white/5 hover:bg-white/10'
                             }`}
                           >
                             <div className="flex items-center gap-3">
-                              <AlertTriangle size={18} />
-                              <span className="text-xs font-black uppercase tracking-wider">Reportar Avaria / Dano</span>
+                              <div className={`w-8 h-8 rounded-xl flex items-center justify-center transition-all ${
+                                selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'damaged')
+                                  ? 'bg-white/20' 
+                                  : 'bg-white/5 text-red-500 group-hover/damage:scale-110'
+                              }`}>
+                                <AlertTriangle size={16} />
+                              </div>
+                              <span className="text-[10px] font-black uppercase tracking-[0.15em] leading-none mt-0.5">{language === 'pt' ? 'Reportar Avaria / Dano' : 'Report Damage'}</span>
                             </div>
-                            <div className={`w-5 h-5 rounded-full border-2 flex items-center justify-center ${
+                            <div className={`w-6 h-6 rounded-full flex items-center justify-center border transition-all ${
                               selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'damaged')
-                                ? 'bg-white border-white text-red-500'
-                                : 'border-zinc-700'
+                                ? 'bg-white border-white text-red-500 rotate-0 scale-100'
+                                : 'bg-transparent border-white/10 text-transparent rotate-90 scale-50'
                             }`}>
-                              {selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'damaged') && <Check size={12} strokeWidth={4} />}
+                              <Check size={12} strokeWidth={4} />
                             </div>
                           </button>
 
                           {/* Criticality Section */}
-                          <div className="bg-zinc-950/50 border border-white/5 rounded-2xl p-3.5 space-y-3">
-                            <div className="flex items-center justify-between">
-                              <span className="text-[9px] font-black text-zinc-500 uppercase tracking-widest">{t('criticality')}</span>
-                              <div className="flex gap-2">
-                                {[
-                                  { id: 'A', color: '#ef4444', icon: '!!!' },
-                                  { id: 'B', color: '#eab308', icon: '!!' },
-                                  { id: 'C', color: '#22c55e', icon: '!' }
-                                ].map(c => {
-                                  const isSelected = selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'damaged')?.criticality === c.id;
-                                  return (
-                                    <button
-                                      key={c.id}
-                                      onClick={() => updateItemCriticality(focusedPart.id, 'damaged', c.id as Criticality)}
-                                      className={`w-10 h-8 rounded-lg border-2 flex items-center justify-center transition-all relative group ${
-                                        isSelected 
-                                          ? 'border-white bg-zinc-800 shadow-[0_0_15px_rgba(255,255,255,0.1)] scale-110 z-10' 
-                                          : 'border-transparent bg-zinc-900 opacity-40 hover:opacity-80'
-                                      }`}
-                                    >
-                                      <div 
-                                        className="relative flex items-center justify-center"
-                                        style={{ color: c.color }}
-                                      >
-                                        <AlertTriangle size={24} strokeWidth={1.5} fill={isSelected ? `${c.color}20` : 'none'} />
-                                        <span className="absolute text-[8px] font-black mt-1">{c.icon}</span>
-                                      </div>
-                                    </button>
-                                  );
-                                })}
-                              </div>
-                            </div>
-
-                            {/* Criticality Label Display */}
-                            <div className="bg-black/40 rounded-xl px-3 py-2 border border-white/5 flex items-center gap-2">
-                              {(() => {
-                                const crit = selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'damaged')?.criticality;
-                                if (crit === 'A') return <><div className="w-2 h-2 rounded-full bg-red-500"/><span className="text-[9px] font-bold text-red-400 uppercase tracking-widest">A ({t('highCriticality')})</span></>;
-                                if (crit === 'B') return <><div className="w-2 h-2 rounded-full bg-yellow-500"/><span className="text-[9px] font-bold text-yellow-400 uppercase tracking-widest">B ({t('mediumCriticality')})</span></>;
-                                if (crit === 'C') return <><div className="w-2 h-2 rounded-full bg-green-500"/><span className="text-[9px] font-bold text-green-400 uppercase tracking-widest">C ({t('lowCriticality')})</span></>;
-                                return <span className="text-[9px] font-bold text-zinc-600 uppercase tracking-widest italic">{language === 'pt' ? 'Nenhuma selecionada' : 'None selected'}</span>;
-                              })()}
-                            </div>
-                          </div>
-
-                          {/* Annotations Section */}
-                          <div className="bg-zinc-950/50 border border-white/5 rounded-2xl p-3.5 space-y-3">
-                            <div className="flex items-center justify-between">
-                              <span className="text-[9px] font-black text-zinc-500 uppercase tracking-widest">{t('annotations')}</span>
-                              <button 
-                                onClick={() => {
-                                  const item = selectedItems.find(i => i.part.id === focusedPart.id);
-                                  if (item) updateItemAnnotations(item.part.id, item.type, []);
-                                }}
-                                className="text-[9px] font-black text-red-500/80 hover:text-red-500 uppercase tracking-widest transition-colors"
+                          <AnimatePresence>
+                            {selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'damaged') && (
+                              <motion.div 
+                                initial={{ opacity: 0, height: 0, marginTop: 0 }}
+                                animate={{ opacity: 1, height: 'auto', marginTop: 12 }}
+                                exit={{ opacity: 0, height: 0, marginTop: 0 }}
+                                className="overflow-hidden bg-zinc-950/50 border border-white/5 rounded-[28px] p-4 pt-5 space-y-4 shadow-inner"
                               >
-                                {language === 'pt' ? 'Limpar' : 'Clear'}
-                              </button>
-                            </div>
-                            
-                            <div className="grid grid-cols-4 gap-1.5">
-                              {[
-                                { id: 'none', icon: MousePointer2, label: 'Mouse' },
-                                { id: 'circle', icon: Target, label: 'Círculo' },
-                                { id: 'arrow', icon: Navigation, label: 'Seta' },
-                                { id: 'box', icon: Square, label: 'Box' },
-                                { id: 'text', icon: Type, label: 'Texto' },
-                                { id: 'callout', icon: Tag, label: 'Callout' },
-                                { id: 'crop-circle', icon: Aperture, label: 'Lupa' },
-                                { id: 'eraser', icon: Eraser, label: 'Borracha' }
-                              ].map(tool => (
-                                <button
-                                  key={tool.id}
-                                  onClick={() => setActiveTool(tool.id as AnnotationType)}
-                                  className={`h-11 rounded-xl flex flex-col items-center justify-center transition-all relative ${
-                                    activeTool === tool.id 
-                                      ? 'bg-landcros text-white shadow-lg scale-105' 
-                                      : 'bg-zinc-800 text-zinc-500 hover:text-zinc-300 shadow-inner'
-                                  }`}
-                                >
-                                  <tool.icon size={16} className={tool.id === 'arrow' ? 'rotate-45' : ''} />
-                                  <span className="text-[6px] font-black uppercase tracking-tighter mt-1">{tool.label}</span>
-                                </button>
-                              ))}
-                            </div>
-
-                            <div className="grid grid-cols-4 gap-1.5">
-                              {[
-                                { color: '#f27d26', label: 'Landcros' },
-                                { color: '#ef4444', label: 'Perigo' },
-                                { color: '#22c55e', label: 'OK' },
-                                { color: '#ffffff', label: 'Info' }
-                              ].map(c => (
-                                <button
-                                  key={c.color}
-                                  onClick={() => setActiveColor(c.color)}
-                                  className={`h-10 rounded-xl border-2 transition-all flex items-center justify-center relative overflow-hidden group ${activeColor === c.color ? 'border-white shadow-xl scale-105' : 'border-transparent opacity-60'}`}
-                                  style={{ backgroundColor: c.color }}
-                                >
-                                  {c.color === '#ffffff' && <div className="w-1.5 h-1.5 rounded-full bg-black" />}
-                                  {activeColor === c.color && <div className="absolute inset-0 bg-white/10 blur-sm" />}
-                                </button>
-                              ))}
-                            </div>
-                          </div>
+                                <div className="flex items-center justify-between px-1">
+                                  <span className="text-[9px] font-black text-zinc-500 uppercase tracking-widest">Criticality</span>
+                                  <div className="flex items-center gap-2">
+                                    {[
+                                      { id: 'A', color: '#ef4444', icon: '!!!' },
+                                      { id: 'B', color: '#facc15', icon: '!!' },
+                                      { id: 'C', color: '#22c55e', icon: '!' }
+                                    ].map(c => {
+                                      const isSelected = selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'damaged')?.criticality === c.id;
+                                      return (
+                                        <button
+                                          key={c.id}
+                                          onClick={() => updateItemCriticality(focusedPart.id, 'damaged', c.id as Criticality)}
+                                          className={`w-12 h-10 rounded-xl flex items-center justify-center transition-all relative ${
+                                            isSelected 
+                                              ? 'bg-zinc-800 shadow-xl scale-110 z-10 border border-white/10' 
+                                              : 'opacity-20 hover:opacity-100'
+                                          }`}
+                                        >
+                                          <div className="relative flex items-center justify-center" style={{ color: c.color }}>
+                                            <AlertTriangle size={28} strokeWidth={1} fill={isSelected ? `${c.color}20` : 'none'} />
+                                            <span className="absolute text-[8px] font-black mt-2 tracking-tighter">{c.icon}</span>
+                                          </div>
+                                          {isSelected && (
+                                            <motion.div 
+                                              layoutId="crit-active"
+                                              className="absolute -bottom-1 left-1/2 -translate-x-1/2 w-4 h-0.5 rounded-full"
+                                              style={{ backgroundColor: c.color }}
+                                            />
+                                          )}
+                                        </button>
+                                      );
+                                    })}
+                                  </div>
+                                </div>
+                                <div className="h-2 w-full bg-black/40 rounded-full overflow-hidden p-[2px] shadow-inner">
+                                  <motion.div 
+                                    initial={{ width: 0 }}
+                                    animate={{ 
+                                      width: (() => {
+                                        const crit = selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'damaged')?.criticality;
+                                        if (crit === 'A') return '100%';
+                                        if (crit === 'B') return '66%';
+                                        return '33%';
+                                      })()
+                                    }}
+                                    className={`h-full rounded-full transition-all duration-500 relative`}
+                                    style={{ 
+                                      backgroundColor: (() => {
+                                        const crit = selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'damaged')?.criticality;
+                                        if (crit === 'A') return '#ef4444';
+                                        if (crit === 'B') return '#facc15';
+                                        return '#22c55e';
+                                      })()
+                                    }}
+                                  >
+                                    <div className="absolute right-1 top-1/2 -translate-y-1/2 w-1 h-1 bg-white rounded-full shadow-[0_0_8px_white]" />
+                                  </motion.div>
+                                </div>
+                              </motion.div>
+                            )}
+                          </AnimatePresence>
 
                           {/* Photos Evidence Section */}
-                          <div className="space-y-2">
-                             <span className="text-[9px] font-black text-zinc-500 uppercase tracking-widest px-1">{t('evidence')}</span>
-                             <div 
-                              className="relative aspect-video bg-black rounded-2xl overflow-hidden border border-white/5 group/photo shadow-inner"
-                              onClick={(e) => {
-                                if (activeTool === 'none') return;
-                                e.stopPropagation();
+                          <div className="space-y-3 pt-2">
+                             <div className="flex items-center justify-between px-1">
+                               <span className="text-[9px] font-black text-zinc-500 uppercase tracking-widest">Evidências Fotográficas</span>
+                               {selectedItems.find(i => i.part.id === focusedPart.id)?.photo && (
+                                 <button 
+                                   onClick={deleteInspectionPhoto}
+                                   className="p-1.5 bg-red-500/10 text-red-500 hover:bg-red-500 hover:text-white rounded-lg transition-all"
+                                 >
+                                   <Trash2 size={12} />
+                                 </button>
+                               )}
+                             </div>
+                             
+                             {(() => {
                                 const item = selectedItems.find(i => i.part.id === focusedPart.id);
-                                if (!item) return;
-
-                                const rect = e.currentTarget.getBoundingClientRect();
-                                const mx = (e.clientX - rect.left) / rect.width * 1000;
-                                const my = (e.clientY - rect.top) / rect.height * 1000;
-
-                                if (activeTool === 'eraser') {
-                                  const filtered = (item.annotations || []).filter(ann => {
-                                    const dist = Math.sqrt(Math.pow(ann.x - mx, 2) + Math.pow(ann.y - my, 2));
-                                    return dist > 50; 
-                                  });
-                                  updateItemAnnotations(item.part.id, item.type, filtered);
-                                  return;
-                                }
-
-                                const ann: Annotation = {
-                                  id: `ann-${Date.now()}`,
-                                  type: activeTool,
-                                  x: mx, y: my,
-                                  color: activeColor,
-                                  width: 50, height: 50
-                                };
-
-                                updateItemAnnotations(item.part.id, item.type, [...(item.annotations || []), ann]);
-                              }}
-                            >
-                              {(() => {
-                                const item = selectedItems.find(i => i.part.id === focusedPart.id);
-                                if (item?.photo) {
-                                  const damagedItem = selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'damaged');
-                                  const configs = {
-                                    'A': { bg: 'bg-red-600', text: t('highCriticality'), icon: '!!!' },
-                                    'B': { bg: 'bg-yellow-500', text: t('mediumCriticality'), icon: '!!' },
-                                    'C': { bg: 'bg-zinc-500', text: t('lowCriticality'), icon: '!' }
-                                  };
-                                  const conf = damagedItem?.criticality ? configs[damagedItem.criticality as keyof typeof configs] : null;
-
+                                if (!item?.photo) {
                                   return (
-                                    <>
-                                      <img 
-                                        src={item.photo} 
-                                        className="w-full h-full object-contain" 
-                                        alt="Inspeção" 
-                                      />
+                                    <div className="grid grid-cols-2 gap-2.5 bg-zinc-950/40 rounded-[28px] p-4 border border-white/5 shadow-inner">
+                                      <button 
+                                        onClick={() => setIsCameraOpen(true)}
+                                        className="h-32 bg-zinc-900 border border-white/5 rounded-[20px] flex flex-col items-center justify-center gap-3 group hover:border-landcros/30 transition-all shadow-lg active:scale-95"
+                                      >
+                                        <div className="p-3 bg-zinc-800 rounded-2xl group-hover:bg-landcros/10 group-hover:scale-110 transition-all duration-300">
+                                          <Camera size={24} className="text-landcros group-hover:rotate-12" />
+                                        </div>
+                                        <span className="text-[10px] font-black text-zinc-500 uppercase tracking-widest group-hover:text-white mt-1">Câmera</span>
+                                      </button>
                                       
-                                      <div className="absolute inset-0 pointer-events-none">
-                                        <svg viewBox="0 0 1000 1000" className="w-full h-full">
-                                          {(item.annotations || []).map(ann => (
-                                            <g key={ann.id}>
-                                              {ann.type === 'circle' && (
-                                                <circle cx={ann.x} cy={ann.y} r={ann.width!/2} fill="none" stroke={ann.color} strokeWidth="6" />
-                                              )}
-                                              {ann.type === 'arrow' && (
-                                                <g stroke={ann.color} strokeWidth="6" fill="none">
-                                                  <line x1={ann.x} y1={ann.y} x2={ann.x+40} y2={ann.y-40} />
-                                                  <path d={`M ${ann.x+25} ${ann.y-35} L ${ann.x+40} ${ann.y-40} L ${ann.x+35} ${ann.y-25}`} strokeLinecap="round" strokeLinejoin="round" />
-                                                </g>
-                                              )}
-                                            </g>
-                                          ))}
-                                        </svg>
+                                      <label className="h-32 bg-zinc-900 border border-white/5 rounded-[20px] flex flex-col items-center justify-center gap-3 group hover:border-landcros/30 cursor-pointer transition-all shadow-lg active:scale-95">
+                                        <div className="p-3 bg-zinc-800 rounded-2xl group-hover:bg-landcros/10 group-hover:scale-110 transition-all duration-300">
+                                          <Upload size={24} className="text-zinc-500 group-hover:text-landcros group-hover:-translate-y-1" />
+                                        </div>
+                                        <span className="text-[10px] font-black text-zinc-500 uppercase tracking-widest group-hover:text-white mt-1">Galeria</span>
+                                        <input type="file" className="hidden" accept="image/*" onChange={handleInspectionPhotoUpload} />
+                                      </label>
+                                      <div className="col-span-2 text-center pt-1">
+                                        <span className="text-[8px] font-black text-zinc-700 uppercase tracking-[0.3em]">Adicionar Evidência</span>
                                       </div>
-                                    </>
+                                    </div>
                                   );
                                 }
 
                                 return (
-                                  <div className="absolute inset-0 flex flex-col items-center justify-center gap-3 text-zinc-800">
-                                    <Camera size={40} strokeWidth={1} />
-                                    <span className="text-[8px] font-black uppercase tracking-[0.2em]">{t('noEvidence')}</span>
+                                  <div className="relative aspect-[4/3] bg-zinc-950 rounded-[32px] overflow-hidden border-2 border-white/5 shadow-2xl group/photo">
+                                    <img 
+                                      src={item.photo} 
+                                      className="w-full h-full object-cover group-hover:scale-105 transition-transform duration-700" 
+                                      alt="Evidência" 
+                                    />
+                                    
+                                    {/* Annotation Static Layer */}
+                                    <div className="absolute inset-0 pointer-events-none opacity-90">
+                                      <svg viewBox="0 0 1000 1000" className="w-full h-full drop-shadow-lg">
+                                        {(item.annotations || []).map(ann => (
+                                          <g key={ann.id}>
+                                            {ann.type === 'circle' && (
+                                              <circle cx={ann.x} cy={ann.y} r={ann.width!/2} fill="none" stroke={ann.color} strokeWidth="8" />
+                                            )}
+                                            {ann.type === 'arrow' && (
+                                              <g stroke={ann.color} strokeWidth="8" fill="none">
+                                                <line x1={ann.x} y1={ann.y} x2={ann.x + Math.cos(ann.rotation || 0) * ann.width!} y2={ann.y + Math.sin(ann.rotation || 0) * ann.width!} />
+                                              </g>
+                                            )}
+                                          </g>
+                                        ))}
+                                      </svg>
+                                    </div>
+
+                                    {/* Photo Actions Overlay */}
+                                    <div className="absolute inset-0 flex items-center justify-center bg-black/60 opacity-0 group-hover/photo:opacity-100 transition-all duration-300 backdrop-blur-[2px] p-6">
+                                      <div className="grid grid-cols-4 gap-3 w-full">
+                                        <button 
+                                          onClick={() => setHighlightState({ isOpen: true, activeAnnId: null })}
+                                          className="aspect-square rounded-2xl bg-landcros text-white flex items-center justify-center transition-all hover:scale-110 active:scale-90 shadow-xl"
+                                          title="Marcar Área"
+                                        >
+                                          <Target size={24} />
+                                        </button>
+                                        <button 
+                                          onClick={() => setIsCameraOpen(true)}
+                                          className="aspect-square rounded-2xl bg-zinc-800 hover:bg-zinc-700 text-white flex items-center justify-center transition-all hover:scale-110 active:scale-90 shadow-xl"
+                                          title="Trocar Foto"
+                                        >
+                                          <Camera size={24} />
+                                        </button>
+                                        <label className="aspect-square rounded-2xl bg-zinc-800 hover:bg-zinc-700 text-white flex items-center justify-center transition-all hover:scale-110 active:scale-90 shadow-xl cursor-pointer">
+                                          <Upload size={24} />
+                                          <input type="file" className="hidden" accept="image/*" onChange={handleInspectionPhotoUpload} />
+                                        </label>
+                                        <button 
+                                          onClick={deleteInspectionPhoto}
+                                          className="aspect-square rounded-2xl bg-red-500/20 hover:bg-red-500 text-red-500 hover:text-white flex items-center justify-center transition-all hover:scale-110 active:scale-90 shadow-xl"
+                                          title="Remover Foto"
+                                        >
+                                          <Trash2 size={24} />
+                                        </button>
+                                      </div>
+                                    </div>
                                   </div>
                                 );
-                              })()}
-                              
-                              <div className="absolute inset-0 flex items-center justify-center bg-black/70 opacity-0 group-hover/photo:opacity-100 transition-all backdrop-blur-[2px]">
-                                <div className="flex flex-col gap-2">
-                                  <button 
-                                    onClick={(e) => { e.stopPropagation(); setIsCameraOpen(true); }}
-                                    className="bg-landcros text-white px-5 py-2.5 rounded-2xl text-[9px] font-black uppercase tracking-widest flex items-center gap-2 hover:scale-105 transition-transform"
-                                  >
-                                    <Camera size={16} />
-                                    {selectedItems.find(i => i.part.id === focusedPart.id)?.photo ? (language === 'pt' ? 'Substituir' : 'Replace') : (language === 'pt' ? 'Capturar' : 'Capture')}
-                                  </button>
-                                  <label className="bg-white/10 hover:bg-white/20 text-white px-5 py-2.5 rounded-2xl text-[9px] font-black uppercase tracking-widest flex items-center gap-2 cursor-pointer transition-all backdrop-blur-sm hover:scale-105 text-center justify-center">
-                                    <Upload size={14} />
-                                    {language === 'pt' ? 'Anexar' : 'Attach'}
-                                    <input 
-                                      type="file" 
-                                      className="hidden" 
-                                      accept="image/*" 
-                                      onChange={(e) => {
-                                        e.stopPropagation();
-                                        handleInspectionPhotoUpload(e);
-                                      }} 
-                                    />
-                                  </label>
-                                  {selectedItems.find(i => i.part.id === focusedPart.id)?.photo && (
-                                    <button 
-                                      onClick={(e) => { e.stopPropagation(); deleteInspectionPhoto(); }}
-                                      className="bg-red-500/20 hover:bg-red-500 text-red-500 hover:text-white px-5 py-2.5 rounded-2xl text-[9px] font-black uppercase tracking-widest flex items-center gap-2 transition-all hover:scale-105"
-                                    >
-                                      <Trash2 size={14} />
-                                      {language === 'pt' ? 'Excluir' : 'Delete'}
-                                    </button>
-                                  )}
-                                </div>
-                              </div>
-                            </div>
-                          </div>
-
-                          <div className="grid grid-cols-2 gap-2 pt-2">
-                            <button 
-                              onClick={() => toggleItem(focusedPart, 'order')}
-                              className={`py-2.5 rounded-2xl border flex items-center justify-center gap-1.5 transition-all ${
-                                selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'order')
-                                  ? 'bg-landcros text-white border-landcros'
-                                  : 'bg-white/5 border-white/10 text-zinc-500 hover:text-white'
-                              }`}
-                            >
-                              <ShoppingCart size={14} />
-                              <span className="text-[9px] font-black uppercase tracking-widest">Adicionar ao Pedido</span>
-                            </button>
-                            <button 
-                              onClick={() => {
-                                // Just visual focus on the damaged toggle
-                                const exists = selectedItems.find(i => i.part.id === focusedPart.id && i.type === 'damaged');
-                                if (!exists) toggleItem(focusedPart, 'damaged');
-                              }}
-                              className="py-2.5 rounded-2xl border bg-white/5 border-white/10 text-zinc-500 hover:text-white flex items-center justify-center gap-1.5"
-                            >
-                              <Search size={14} />
-                              <span className="text-[9px] font-black uppercase tracking-widest">Detalhes</span>
-                            </button>
+                             })()}
                           </div>
                         </motion.div>
                       )}
@@ -3476,9 +3827,17 @@ export default function App() {
                       </div>
                     </div>
 
-                    <div className="p-3 bg-black/40 border-t border-white/5 flex justify-between text-[8px] font-black uppercase tracking-widest text-zinc-600">
-                      <span>{language === 'pt' ? 'Pedidos' : 'Orders'}: {orderList.length}</span>
-                      <span>{language === 'pt' ? 'Avarias' : 'Damages'}: {damagedList.length}</span>
+                    {/* Full-width Footer statistics */}
+                    <div className="mt-4 pt-4 border-t border-white/10 flex items-center justify-between text-[10px] font-black px-1 pb-2">
+                      <div className="flex flex-col">
+                        <span className="text-zinc-600 uppercase tracking-[0.2em] leading-none mb-1.5 text-[8px]">Orders</span>
+                        <span className="text-landcros text-2xl leading-none font-black italic">{orderList.length}</span>
+                      </div>
+                      <div className="h-10 w-px bg-white/5" />
+                      <div className="flex flex-col text-right">
+                        <span className="text-zinc-600 uppercase tracking-[0.2em] leading-none mb-1.5 text-[8px]">Damages</span>
+                        <span className="text-red-500 text-2xl leading-none font-black italic">{damagedList.length}</span>
+                      </div>
                     </div>
                   </motion.div>
                 )}
@@ -3565,6 +3924,368 @@ export default function App() {
           </div>
         )}
       </main>
+
+      {/* Highlight Modal (Advanced Annotation) */}
+      <AnimatePresence>
+        {highlightState.isOpen && focusedPart && (
+          <motion.div 
+            initial={{ opacity: 0 }}
+            animate={{ opacity: 1 }}
+            exit={{ opacity: 0 }}
+            className="fixed inset-0 z-[110] bg-[#0c0c0c] flex flex-col font-sans"
+          >
+            {/* Header / Top Toolbar */}
+            <div className="relative p-6 flex items-center justify-between z-50 shrink-0 border-b border-white/5 bg-[#0c0c0c]">
+              <div className="flex items-center gap-4">
+                <button 
+                  onClick={() => setIsHighlightToolbarVisible(!isHighlightToolbarVisible)}
+                  className={`px-4 py-2 rounded-2xl transition-all flex items-center gap-2 border ${isHighlightToolbarVisible ? 'bg-zinc-900 border-white/10 text-white' : 'bg-landcros border-landcros text-white shadow-lg shadow-landcros/20'}`}
+                >
+                  <Wrench size={16}/>
+                  <span className="text-[12px] font-black uppercase tracking-widest">{isHighlightToolbarVisible ? 'Ocultar' : 'Ferramentas'}</span>
+                </button>
+                <div className="h-4 w-[1px] bg-white/10" />
+                <div className="w-10 h-10 rounded-2xl bg-landcros/20 flex items-center justify-center text-landcros">
+                  <Target size={24} />
+                </div>
+                <div>
+                  <span className="text-[10px] font-black uppercase tracking-[0.3em] text-zinc-500 block leading-none mb-1">Highlight Mode</span>
+                  <h2 className="text-white font-black text-lg uppercase tracking-tight leading-none">{focusedPart.partNumber}</h2>
+                </div>
+              </div>
+
+              <div className="flex items-center gap-2">
+                <div className="flex bg-zinc-900 border border-white/5 rounded-2xl p-1 gap-1">
+                  <button onClick={() => { isInteractingRef.current = true; setIsCameraOpen(true); }} className="p-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white rounded-xl transition-all" title="Câmera"><Camera size={20}/></button>
+                  <label className="p-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white rounded-xl transition-all cursor-pointer" title="Galeria">
+                    <Upload size={20}/>
+                    <input type="file" className="hidden" accept="image/*" onChange={(e) => { isInteractingRef.current = true; handleInspectionPhotoUpload(e); }} />
+                  </label>
+                  <button onClick={() => { isInteractingRef.current = true; deleteInspectionPhoto(); }} className="p-3 bg-zinc-800 hover:bg-zinc-700 text-zinc-400 hover:text-white rounded-xl transition-all" title="Excluir"><Trash2 size={20}/></button>
+                </div>
+                <button 
+                  onClick={() => { isInteractingRef.current = false; setHighlightState({ ...highlightState, isOpen: false }); }}
+                  className="p-4 bg-white/5 hover:bg-white/10 rounded-2xl text-white transition-all backdrop-blur-md border border-white/5"
+                >
+                  <X size={24} />
+                </button>
+              </div>
+            </div>
+
+            {/* Static Toolbar (Not overlapping image) */}
+            <AnimatePresence mode="wait">
+              {isHighlightToolbarVisible && (
+                <motion.div 
+                  initial={{ height: 0, opacity: 0 }}
+                  animate={{ height: 'auto', opacity: 1 }}
+                  exit={{ height: 0, opacity: 0 }}
+                  className="bg-[#141414] border-b border-white/10 px-6 py-3 flex items-center justify-center gap-10 z-40 shrink-0 overflow-hidden"
+                >
+                  <div className="flex gap-2">
+                    {[
+                      { color: '#000000', label: 'Black' },
+                      { color: '#f27d26', label: 'Landcros' },
+                      { color: '#ef4444', label: 'Danger' },
+                      { color: '#22c55e', label: 'OK' },
+                      { color: '#ffffff', label: 'Info' }
+                    ].map(c => (
+                      <button
+                        key={c.color}
+                        onClick={() => setActiveColor(c.color)}
+                        className={`w-8 h-8 rounded-full border-2 transition-all relative ${activeColor === c.color ? 'border-white scale-110 shadow-lg' : 'border-transparent opacity-60 hover:opacity-100'}`}
+                        style={{ backgroundColor: c.color }}
+                      >
+                        {activeColor === c.color && <motion.div layoutId="color-dot-modal" className="absolute -top-1 -right-1 w-3 h-3 bg-white rounded-full flex items-center justify-center text-black shadow-lg"><Check size={8} strokeWidth={4}/></motion.div>}
+                      </button>
+                    ))}
+                  </div>
+
+                  <div className="h-6 w-[1px] bg-white/10" />
+
+                  <div className="flex gap-1">
+                    {[
+                      { id: 'none', icon: MousePointer2, label: 'Mouse' },
+                      { id: 'circle', icon: Target, label: 'Círculo' },
+                      { id: 'arrow', icon: Navigation, label: 'Seta' },
+                      { id: 'box', icon: Square, label: 'Box' },
+                      { id: 'text', icon: Type, label: 'Texto' },
+                      { id: 'callout', icon: Tag, label: 'Callout' },
+                      { id: 'crop-circle', icon: Aperture, label: 'Lupa' },
+                      { id: 'photo', icon: ImageIcon, label: 'Foto' },
+                      { id: 'eraser', icon: Eraser, label: 'Borracha' }
+                    ].map(tool => (
+                      <button
+                        key={tool.id}
+                        onClick={() => setActiveTool(tool.id as AnnotationType)}
+                        className={`px-4 py-2 rounded-xl flex items-center gap-2 transition-all relative group ${
+                          activeTool === tool.id 
+                            ? 'bg-landcros text-white shadow-xl' 
+                            : 'bg-white/5 text-zinc-500 hover:text-zinc-200 hover:bg-white/10'
+                        }`}
+                      >
+                        <tool.icon size={16} className={tool.id === 'arrow' ? 'rotate-45' : ''} />
+                        <span className="text-[9px] font-black uppercase tracking-tight">{tool.label}</span>
+                      </button>
+                    ))}
+                  </div>
+                </motion.div>
+              )}
+            </AnimatePresence>
+
+            {/* Main Workspace */}
+            <div className="flex-1 relative overflow-hidden flex items-center justify-center p-20 bg-[radial-gradient(circle_at_center,_#1a1a1a_0%,_#0c0c0c_100%)]">
+              <div className="absolute inset-0 opacity-[0.03] pointer-events-none" style={{ backgroundImage: 'radial-gradient(#fff 1px, transparent 1px)', backgroundSize: '30px 30px' }} />
+              
+              <div 
+                className="relative aspect-[4/3] w-full max-w-5xl bg-black rounded-[48px] overflow-hidden shadow-[0_0_100px_rgba(0,0,0,0.8)] border-4 border-white/5 group"
+                onClick={(e) => {
+                  if (activeTool === 'none') return;
+                  if (!activeHighlightItem) return;
+
+                  const rect = e.currentTarget.getBoundingClientRect();
+                  const mx = (e.clientX - rect.left) / rect.width * 1000;
+                  const my = (e.clientY - rect.top) / rect.height * 1000;
+
+                  if (activeTool === 'eraser') {
+                    const filtered = (activeHighlightItem.annotations || []).filter(ann => {
+                      const dist = Math.sqrt(Math.pow(ann.x - mx, 2) + Math.pow(ann.y - my, 2));
+                      return dist > 50; 
+                    });
+                    updateItemAnnotations(activeHighlightItem.part.id, activeHighlightItem.type, filtered);
+                    return;
+                  }
+
+                  if (activeTool === 'photo') {
+                    setPendingAnnotation({ x: mx, y: my, isDiagram: false, itemId: focusedPart.id, itemType: activeHighlightItem.type });
+                    annotationFileRef.current?.click();
+                    return;
+                  }
+
+                  const annId = `ann-${Date.now()}`;
+                  const ann: Annotation = {
+                    id: annId,
+                    type: activeTool,
+                    x: mx, y: my,
+                    color: activeColor,
+                    width: activeTool === 'arrow' ? 150 : 80,
+                    height: 80,
+                    rotation: activeTool === 'arrow' ? -Math.PI/4 : 0,
+                    strokeWidth: 8,
+                    fontSize: 24,
+                    text: activeTool === 'text' || activeTool === 'callout' ? (language === 'pt' ? 'NOVO TEXTO' : 'NEW TEXT') : undefined
+                  };
+
+                  updateItemAnnotations(activeHighlightItem.part.id, activeHighlightItem.type, [...(activeHighlightItem.annotations || []), ann]);
+                  setHighlightState(prev => ({ ...prev, activeAnnId: annId }));
+                  isInteractingRef.current = false; // Release immediately after stamp
+                }}
+              >
+                {activeHighlightItem?.photo ? (
+                  <>
+                    <img 
+                      src={activeItemBlobUrl || activeHighlightItem.photo} 
+                      className="w-full h-full object-cover select-none" 
+                      style={{ willChange: 'transform', transform: 'translateZ(0)' }}
+                      alt="Annotation Canvas" 
+                    />
+                    
+                    <div className="absolute inset-0" style={{ willChange: 'transform', transform: 'translateZ(0)' }}>
+                      <svg viewBox="0 0 1000 1000" className={`w-full h-full ${isHighlightDragging ? '' : 'drop-shadow-2xl'}`}>
+                        <defs>
+                          <image 
+                            id={`highres-photo-${focusedPart?.id}`}
+                            href={activeItemBlobUrl || activeHighlightItem.photo} 
+                            width="1000" 
+                            height="1000" 
+                          />
+                        </defs>
+                        {(activeHighlightItem.annotations || []).map(ann => {
+                          const isActive = highlightState.activeAnnId === ann.id;
+                              return (
+                                <g 
+                                  key={ann.id} 
+                                  onClick={(e) => {
+                                    e.stopPropagation();
+                                    setHighlightState(prev => ({ ...prev, activeAnnId: ann.id }));
+                                  }}
+                                  onMouseDown={(e) => handleAnnMouseDown(e, ann)}
+                                  className="cursor-pointer pointer-events-auto"
+                                >
+                                  {ann.type === 'circle' && (
+                                    <circle cx={ann.x} cy={ann.y} r={ann.width!/2} fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth || 8} strokeDasharray={ann.dash ? "15,10" : "none"} />
+                                  )}
+                                  {ann.type === 'arrow' && (
+                                    <g stroke={ann.color} strokeWidth={ann.strokeWidth || 8} fill="none">
+                                      <line x1={ann.x} y1={ann.y} x2={ann.x + Math.cos(ann.rotation || 0) * ann.width!} y2={ann.y + Math.sin(ann.rotation || 0) * ann.width!} />
+                                      {/* Arrow head */}
+                                      <path 
+                                        d={`M ${ann.x + Math.cos(ann.rotation || 0) * ann.width!} ${ann.y + Math.sin(ann.rotation || 0) * ann.width!} l ${-(ann.strokeWidth || 8) * 2 * Math.cos((ann.rotation || 0) - Math.PI/6)} ${-(ann.strokeWidth || 8) * 2 * Math.sin((ann.rotation || 0) - Math.PI/6)} m ${(ann.strokeWidth || 8) * 2 * Math.cos((ann.rotation || 0) - Math.PI/6)} ${(ann.strokeWidth || 8) * 2 * Math.sin((ann.rotation || 0) - Math.PI/6)} l ${-(ann.strokeWidth || 8) * 2 * Math.cos((ann.rotation || 0) + Math.PI/6)} ${-(ann.strokeWidth || 8) * 2 * Math.sin((ann.rotation || 0) + Math.PI/6)}`} 
+                                        stroke={ann.color} 
+                                        strokeWidth={ann.strokeWidth || 8} 
+                                        strokeLinecap="round"
+                                        strokeLinejoin="round"
+                                      />
+                                    </g>
+                                  )}
+                                  {ann.type === 'box' && (
+                                    <rect x={ann.x - ann.width!/2} y={ann.y - ann.height!/2} width={ann.width} height={ann.height} fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth || 8} strokeDasharray={ann.dash ? "15,10" : "none"} />
+                                  )}
+                                  {ann.type === 'text' && (
+                                    <text x={ann.x} y={ann.y} fill={ann.color} fontSize={ann.fontSize || 24} fontWeight="900" textAnchor="middle" alignmentBaseline="middle" className="select-none uppercase tracking-tight font-sans">{ann.text || 'TEXT'}</text>
+                                  )}
+                                  {ann.type === 'crop-circle' && (
+                                    <g style={{ willChange: 'transform' }}>
+                                      <defs>
+                                        <clipPath id={`clip-${ann.id}`}>
+                                          <circle cx={ann.x} cy={ann.y} r={ann.width!/2} />
+                                        </clipPath>
+                                      </defs>
+                                      
+                                      {/* Magnified Content */}
+                                      <g clipPath={`url(#clip-${ann.id})`}>
+                                        <use 
+                                          href={`#highres-photo-${focusedPart?.id}`}
+                                          transform={`translate(${ann.x}, ${ann.y}) scale(2) translate(${-ann.x}, ${-ann.y})`}
+                                        />
+                                      </g>
+
+                                      {/* Highlight Circle Border */}
+                                      <circle 
+                                        cx={ann.x} cy={ann.y} r={ann.width!/2} 
+                                        fill="none" 
+                                        stroke={ann.color} 
+                                        strokeWidth={ann.strokeWidth || 8} 
+                                        className={isHighlightDragging ? '' : 'drop-shadow-lg'}
+                                      />
+                                      
+                                      {/* Decorative rings for 'Magnifier' look */}
+                                      <circle cx={ann.x} cy={ann.y} r={ann.width!/2 + (ann.strokeWidth || 8)} fill="none" stroke="white" strokeWidth="1" opacity="0.1" />
+                                      <circle cx={ann.x} cy={ann.y} r={ann.width!/2 - (ann.strokeWidth || 8)} fill="none" stroke="black" strokeWidth="1" opacity="0.1" />
+                                    </g>
+                                  )}
+                                  {ann.type === 'photo' && ann.photoUrl && (
+                                    <g>
+                                      <defs>
+                                        <clipPath id={`modal-photo-clip-${ann.id}`}>
+                                          <circle cx={ann.x} cy={ann.y} r={ann.width!/2} />
+                                        </clipPath>
+                                      </defs>
+                                      <image 
+                                        href={annotationBlobUrls[ann.id] || ann.photoUrl} 
+                                        x={ann.x - ann.width!/2} 
+                                        y={ann.y - ann.width!/2} 
+                                        width={ann.width} 
+                                        height={ann.width} 
+                                        clipPath={`url(#modal-photo-clip-${ann.id})`}
+                                        preserveAspectRatio="xMidYMid slice"
+                                      />
+                                      <circle cx={ann.x} cy={ann.y} r={ann.width!/2} fill="none" stroke={ann.color} strokeWidth={ann.strokeWidth || 4} />
+                                    </g>
+                                  )}
+                                  {isActive && (
+                                    <g>
+                                      <circle cx={ann.x} cy={ann.y} r={ann.width!/2 + 20} fill="none" stroke="white" strokeWidth="2" strokeDasharray="5,5" className="animate-[spin_4s_linear_infinite]" />
+                                      <circle cx={ann.x} cy={ann.y} r="10" fill="white" className="shadow-lg" />
+                                    </g>
+                                  )}
+                                </g>
+                              );
+                            })}
+                          </svg>
+                        </div>
+                      </>
+                    ) : null}
+                  </div>
+
+              {/* Fine-Tuning Floater (Ajustes) */}
+              {activeHighlightAnn && (
+                <motion.div 
+                  drag
+                  dragMomentum={false}
+                  initial={{ opacity: 0, x: 100 }}
+                  animate={{ opacity: 1, x: 0 }}
+                  className="absolute right-10 top-1/3 w-64 bg-[#141414]/95 backdrop-blur-xl border border-white/10 rounded-[32px] p-6 shadow-2xl cursor-move space-y-6 z-[70]"
+                >
+                  <div className="flex items-center justify-between">
+                    <div className="flex items-center gap-3">
+                      <div className="w-8 h-8 rounded-xl bg-landcros/20 flex items-center justify-center text-landcros"><Settings size={18}/></div>
+                      <span className="text-[10px] font-black text-white uppercase tracking-widest leading-none">Ajustes</span>
+                    </div>
+                    <button onClick={() => setHighlightState(prev => ({ ...prev, activeAnnId: null }))} className="text-zinc-500 hover:text-white transition-colors"><X size={16}/></button>
+                  </div>
+
+                  <div className="space-y-4">
+                    {/* Size Control */}
+                    <PropertySlider 
+                      label={activeHighlightAnn.type === 'text' ? 'Tamanho da Fonte' : 'Tamanho'}
+                      value={activeHighlightAnn.type === 'text' ? (activeHighlightAnn.fontSize || 24) : (activeHighlightAnn.width || 100)}
+                      min={activeHighlightAnn.type === 'text' ? 10 : 20}
+                      max={activeHighlightAnn.type === 'text' ? 200 : 800}
+                      onInteractionStart={() => { isInteractingRef.current = true; }}
+                      onInteractionEnd={() => { isInteractingRef.current = false; }}
+                      onChange={(val) => {
+                        if (!activeHighlightItem) return;
+                        const updated = (activeHighlightItem.annotations || []).map(a => {
+                          if (a.id === highlightState.activeAnnId) {
+                            if (a.type === 'text') return { ...a, fontSize: val };
+                            return { ...a, width: val, height: val };
+                          }
+                          return a;
+                        });
+                        updateItemAnnotations(activeHighlightItem.part.id, activeHighlightItem.type, updated);
+                      }}
+                    />
+
+                    {/* Thickness Control */}
+                    {activeHighlightAnn.type !== 'text' && (
+                      <PropertySlider 
+                        label="Espessura"
+                        value={activeHighlightAnn.strokeWidth || 8}
+                        min={1}
+                        max={40}
+                        unit="px"
+                        onInteractionStart={() => { isInteractingRef.current = true; }}
+                        onInteractionEnd={() => { isInteractingRef.current = false; }}
+                        onChange={(val) => {
+                          if (!activeHighlightItem) return;
+                          const updated = (activeHighlightItem.annotations || []).map(a => a.id === highlightState.activeAnnId ? { ...a, strokeWidth: val } : a);
+                          updateItemAnnotations(activeHighlightItem.part.id, activeHighlightItem.type, updated);
+                        }}
+                      />
+                    )}
+
+                    {/* Text Edit Control */}
+                    {(activeHighlightAnn.type === 'text' || activeHighlightAnn.type === 'callout') && (
+                      <PropertyInput 
+                        label="Conteúdo do Texto"
+                        value={activeHighlightAnn.text || ''}
+                        onChange={(val) => {
+                          if (!activeHighlightItem) return;
+                          const updated = (activeHighlightItem.annotations || []).map(a => a.id === highlightState.activeAnnId ? { ...a, text: val.toUpperCase() } : a);
+                          updateItemAnnotations(activeHighlightItem.part.id, activeHighlightItem.type, updated);
+                        }}
+                      />
+                    )}
+
+                    <button 
+                      onClick={() => {
+                        if (!activeHighlightItem) return;
+                        const updated = (activeHighlightItem.annotations || []).filter(a => a.id !== highlightState.activeAnnId);
+                        updateItemAnnotations(activeHighlightItem.part.id, activeHighlightItem.type, updated);
+                        setHighlightState(prev => ({ ...prev, activeAnnId: null }));
+                      }}
+                      className="w-full py-4 bg-red-500/10 hover:bg-red-500 text-red-500 hover:text-white rounded-2xl flex items-center justify-center gap-3 transition-all text-[10px] font-black uppercase tracking-widest shadow-lg"
+                    >
+                      <Trash2 size={16} /> Excluir Ajuste
+                    </button>
+                    <div className="text-center opacity-30 text-[8px] font-bold uppercase tracking-[0.3em]">Arraste para mover</div>
+                  </div>
+                </motion.div>
+              )}
+            </div>
+          </motion.div>
+        )}
+      </AnimatePresence>
 
       {/* Camera Modal */}
       <AnimatePresence>
