@@ -1,7 +1,8 @@
 {
-  "name": "Landcros Connect Insight - Image Editor",
+  "name": " INSPE-O-EX1200-7",
   "description": "Ferramenta de catálogo de peças com comandos de manipular imagem: aumentar, diminuir, rotacionar e deslocar.",
   "requestFramePermissions": [
     "camera"
-  ]
+  ],
+  "majorCapabilities": []
 }
