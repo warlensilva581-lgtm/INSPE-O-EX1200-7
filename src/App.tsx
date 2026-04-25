@@ -1068,6 +1068,7 @@ export default function App() {
 
   const innerContainerRef = React.useRef<HTMLDivElement>(null);
   const annotationFileRef = React.useRef<HTMLInputElement>(null);
+  const highlightModalRef = React.useRef<HTMLDivElement>(null);
   const [pendingAnnotation, setPendingAnnotation] = useState<{ x: number, y: number, isDiagram: boolean, itemId?: string, itemType?: ListType } | null>(null);
 
   const handleAddGroup = (name: string) => {
@@ -4037,6 +4038,7 @@ export default function App() {
               <div className="absolute inset-0 opacity-[0.03] pointer-events-none" style={{ backgroundImage: 'radial-gradient(#fff 1px, transparent 1px)', backgroundSize: '30px 30px' }} />
               
               <div 
+                ref={highlightModalRef}
                 className="relative aspect-[4/3] w-full max-w-5xl bg-black rounded-[48px] overflow-hidden shadow-[0_0_100px_rgba(0,0,0,0.8)] border-4 border-white/5 group"
                 onClick={(e) => {
                   if (activeTool === 'none') return;
